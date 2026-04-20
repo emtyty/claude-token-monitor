@@ -1949,7 +1949,7 @@ def main() -> None:
     pca.add_argument("--top", type=int, default=15)
 
     pr = sub.add_parser("report", help="Export a full dashboard (HTML/SVG/TXT)")
-    pr.add_argument("--format", choices=["html", "svg", "txt"], default="html")
+    pr.add_argument("--format", choices=["html", "svg", "txt"], default="txt")
     pr.add_argument("--output", "-o", help="Output path (default: claude-usage-<date>.<ext>)")
     pr.add_argument("--width", type=int, default=140, help="Render width in columns")
     pr.add_argument("--project", help="Filter to one project (substring match, e.g. 'my-app')")

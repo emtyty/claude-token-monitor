@@ -14,7 +14,7 @@ Parse `$ARGUMENTS` to decide which command to run:
 
 | `$ARGUMENTS` pattern | Command to run |
 |---|---|
-| _(empty)_ | `report --format txt --output -` |
+| _(empty)_ | `report --output -` |
 | `daily [N]` | `daily --days <N or 30>` |
 | `weekly [N]` | `weekly --weeks <N or 8>` |
 | `projects [N]` | `projects --top <N or 15>` |
@@ -29,7 +29,7 @@ Parse `$ARGUMENTS` to decide which command to run:
 | `live` | `live` |
 | `export [csv\|json]` | `export --format <fmt or csv>` |
 | `report [html\|svg\|txt] [path]` | `report --format <fmt> -o <path>` |
-| _anything else_ | `report --format txt --output - --project "$ARGUMENTS"` (treat as project filter) |
+| _anything else_ | `report --output - --project "$ARGUMENTS"` (treat as project filter) |
 
 ## Run
 
