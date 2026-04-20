@@ -32,12 +32,16 @@ python monitor.py <command> [options]
 | `daily [--days N]` | Daily breakdown (default 14 days) |
 | `projects [--top N]` | Top projects by cost (default 20) |
 | `sessions [--top N]` | Top sessions by cost |
+| `weekly [--weeks N]` | Per-ISO-week totals (Mon–Sun buckets) |
 | `heatmap [--metric cost\|calls\|tokens]` | 7×24 day-of-week × hour heatmap (local time) |
+| `calendar [--year YYYY] [--metric cost\|calls]` | GitHub-style yearly activity grid |
 | `trend <project> [--days N]` | Daily trend for one project (substring match) |
 | `activity [--days N]` | Per-day unique sessions & projects active + top project of each day |
+| `cache [--top N]` | Cache hit rate + estimated savings per project |
 | `budget [--daily USD] [--monthly USD] [--warn-at 0.8] [--strict]` | Today + MTD spend vs limits |
 | `live [--interval S]` | Auto-refreshing dashboard |
 | `export --format csv\|json [-o path]` | Raw per-call records |
+| `report --format html\|svg\|txt [-o path]` | Full dashboard export (for archive / print-to-PDF) |
 
 ### Examples
 
@@ -70,9 +74,36 @@ python monitor.py budget --monthly 500 --strict
 # Live dashboard while coding
 python monitor.py live --interval 3
 
-# Export everything to CSV
+# Week-level view
+python monitor.py weekly --weeks 8
+
+# GitHub-style calendar for a year
+python monitor.py calendar --year 2026
+
+# Cache efficiency — how much did caching save you?
+python monitor.py cache
+
+# Export full dashboard to HTML (then browser Print -> Save as PDF)
+python monitor.py report --format html -o usage-report.html
+
+# Or archive as SVG (color-accurate, scales cleanly)
+python monitor.py report --format svg -o usage-report.svg
+
+# Export raw per-call records to CSV
 python monitor.py export --format csv -o usage.csv
 ```
+
+## PDF output
+
+There is no dedicated PDF command — adding a PDF-rendering library
+(WeasyPrint, ReportLab) would balloon the dependency footprint for a
+one-file tool. Instead:
+
+1. `python monitor.py report --format html -o report.html`
+2. Open the HTML file in a browser.
+3. Use **File > Print > Save as PDF** (Chrome, Edge, Firefox all support this).
+
+This is typically sharper than library-rendered PDF, and needs no extra install.
 
 ## Pricing
 

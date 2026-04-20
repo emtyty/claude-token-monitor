@@ -645,6 +645,348 @@ def cmd_trend(args) -> None:
     console.print(t)
 
 
+def _iso_week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
+def cmd_weekly(args) -> None:
+    """Per-ISO-week usage (Mon-Sun)."""
+    records = load_all()
+
+    by_week: dict[str, dict] = defaultdict(empty_agg)
+    week_sessions: dict[str, set] = defaultdict(set)
+    week_projects: dict[str, set] = defaultdict(set)
+    for r in records:
+        ts = parse_ts(r.timestamp)
+        if ts is None:
+            continue
+        ws = _iso_week_start(ts.astimezone().date()).isoformat()
+        a = by_week[ws]
+        u = r.usage
+        a["in"]  += int(u.get("input_tokens") or 0)
+        a["out"] += int(u.get("output_tokens") or 0)
+        a["cr"]  += int(u.get("cache_read_input_tokens") or 0)
+        a["cw"]  += int(u.get("cache_creation_input_tokens") or 0)
+        a["cost"] += r.cost
+        a["calls"] += 1
+        if r.session_id:
+            week_sessions[ws].add(r.session_id)
+        if r.project:
+            week_projects[ws].add(r.project)
+
+    weeks = sorted(by_week.keys())
+    if args.weeks:
+        weeks = weeks[-args.weeks:]
+    if not weeks:
+        print("No dated records.")
+        return
+
+    if not RICH:
+        for w in weeks:
+            a = by_week[w]
+            print(f"{w}  calls={a['calls']:5d}  cost={fmt_cost(a['cost'])}  "
+                  f"sessions={len(week_sessions[w]):2d}  projects={len(week_projects[w]):2d}")
+        return
+
+    console = Console()
+    costs = [by_week[w]["cost"] for w in weeks]
+    peak = max(costs) or 1.0
+    bar_width = 14
+
+    t = Table(title=f"Weekly Usage (last {len(weeks)} weeks)", box=box.SIMPLE_HEAVY)
+    t.add_column("Week of", no_wrap=True)
+    t.add_column("Sess", justify="right")
+    t.add_column("Proj", justify="right")
+    t.add_column("Calls", justify="right")
+    t.add_column("Input", justify="right")
+    t.add_column("Output", justify="right")
+    t.add_column("Cost", justify="right", no_wrap=True)
+    t.add_column("", justify="left", no_wrap=True)
+    for w in weeks:
+        a = by_week[w]
+        bar = "█" * int(a["cost"] / peak * bar_width)
+        t.add_row(
+            w, str(len(week_sessions[w])), str(len(week_projects[w])),
+            str(a["calls"]),
+            fmt_num(a["in"]), fmt_num(a["out"]),
+            fmt_cost(a["cost"]),
+            f"[cyan]{bar}[/cyan]",
+        )
+    console.print(t)
+    console.print(f"\n[bold]Total for window:[/bold] [green]{fmt_cost(sum(costs))}[/green]  "
+                  f"across {len({s for w in weeks for s in week_sessions[w]})} sessions")
+
+
+def cmd_calendar(args) -> None:
+    """GitHub-style yearly activity grid (7 rows × 53 cols)."""
+    if not RICH:
+        print("Calendar requires `pip install rich`.", file=sys.stderr)
+        sys.exit(1)
+    records = load_all()
+    year = args.year or date.today().year
+
+    day_cost: dict[date, float] = defaultdict(float)
+    day_calls: dict[date, int] = defaultdict(int)
+    for r in records:
+        ts = parse_ts(r.timestamp)
+        if ts is None:
+            continue
+        d = ts.astimezone().date()
+        if d.year != year:
+            continue
+        day_cost[d] += r.cost
+        day_calls[d] += 1
+
+    if not day_cost:
+        print(f"No records for year {year}.")
+        return
+
+    metric_map = day_cost if args.metric == "cost" else day_calls
+    peak = max(metric_map.values()) or 1.0
+
+    # Build a 7×53 grid. Each column is a week starting on Monday.
+    jan1 = date(year, 1, 1)
+    # shift so column 0 aligns with the Monday of jan1's week
+    grid_start = jan1 - timedelta(days=jan1.weekday())
+    console = Console()
+    dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    # Month label row: show month letter at the first column of each month
+    month_row = [" "] * 53
+    for m in range(1, 13):
+        first = date(year, m, 1)
+        col = (first - grid_start).days // 7
+        if 0 <= col < 53:
+            month_row[col] = first.strftime("%b")[0]
+    # spread 3-letter month initials every few columns? keep single letters.
+
+    console.print(f"[bold]Activity Calendar {year}[/bold]  "
+                  f"(metric: {args.metric}, peak day: "
+                  f"{fmt_cost(peak) if args.metric == 'cost' else int(peak)})")
+    # Month axis — align with cell columns (day-label block is 7 chars wide)
+    month_axis = " " * 7 + "".join(month_row)
+    console.print(f"[dim]{month_axis}[/dim]")
+
+    for dow in range(7):
+        cells = []
+        for col in range(53):
+            d = grid_start + timedelta(weeks=col, days=dow)
+            if d.year != year or d > date.today():
+                cells.append("[grey15] [/]")
+                continue
+            v = metric_map.get(d, 0)
+            cells.append(_heat_cell(v / peak))
+        console.print(f"  [dim]{dow_labels[dow]}[/dim]  {''.join(cells)}")
+
+    # Legend + totals
+    legend = "  ".join(
+        f"{_heat_cell(step[0] + 0.01)} {int(step[0]*100)}%+"
+        for step in _HEAT_STEPS
+    )
+    total_cost = sum(day_cost.values())
+    console.print(f"\n  [bold]{len(day_cost)}[/bold] active days  "
+                  f"[bold]{sum(day_calls.values())}[/bold] calls  "
+                  f"[bold green]{fmt_cost(total_cost)}[/bold green] spent")
+    console.print(f"  Legend: {legend}")
+
+
+def cmd_cache(args) -> None:
+    """Cache efficiency analysis: hit rate and estimated savings."""
+    records = load_all()
+    if not records:
+        print("No records.")
+        return
+
+    def analyze(recs: list[Record]) -> dict:
+        inp = out = cr = cw = 0
+        cost = 0.0
+        uncached_cost = 0.0
+        for r in recs:
+            u = r.usage
+            i = int(u.get("input_tokens") or 0)
+            o = int(u.get("output_tokens") or 0)
+            cri = int(u.get("cache_read_input_tokens") or 0)
+            cwi = int(u.get("cache_creation_input_tokens") or 0)
+            inp += i; out += o; cr += cri; cw += cwi
+            cost += r.cost
+            # "what would it have cost without caching?" — all cache reads
+            # and cache creations would have been plain input tokens.
+            p = model_price(r.model)
+            uncached_cost += (
+                (i + cri + cwi) * p["in"] / 1_000_000
+                + o * p["out"] / 1_000_000
+            )
+        total_input_like = inp + cr + cw
+        hit_rate = (cr / total_input_like) if total_input_like else 0.0
+        savings = uncached_cost - cost
+        return {
+            "calls": len(recs),
+            "input": inp, "output": out, "cache_read": cr, "cache_write": cw,
+            "cost": cost, "uncached_cost": uncached_cost,
+            "savings": savings,
+            "hit_rate": hit_rate,
+        }
+
+    overall = analyze(records)
+
+    # per-project breakdown
+    by_project: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        by_project[r.project].append(r)
+    project_stats = {
+        p: analyze(recs) for p, recs in by_project.items()
+    }
+
+    if not RICH:
+        print(f"Overall cache hit rate: {overall['hit_rate']*100:.1f}%")
+        print(f"Spent: {fmt_cost(overall['cost'])}  "
+              f"Would have cost without caching: {fmt_cost(overall['uncached_cost'])}")
+        print(f"Estimated savings: {fmt_cost(overall['savings'])}")
+        return
+
+    console = Console()
+    console.print(f"[bold]Cache Efficiency[/bold]")
+    console.print(f"  Hit rate:          [cyan]{overall['hit_rate']*100:.1f}%[/cyan] "
+                  f"of input-side tokens came from cache")
+    console.print(f"  Actual spend:      [green]{fmt_cost(overall['cost'])}[/green]")
+    console.print(f"  Without caching:   [red]{fmt_cost(overall['uncached_cost'])}[/red]")
+    console.print(f"  Estimated savings: [bold green]{fmt_cost(overall['savings'])}[/bold green] "
+                  f"([bold]{(overall['savings']/overall['uncached_cost']*100 if overall['uncached_cost'] else 0):.0f}%[/bold])")
+
+    t = Table(title=f"Top {args.top} Projects by Spend (cache view)", box=box.SIMPLE_HEAVY)
+    t.add_column("Project", overflow="ellipsis")
+    t.add_column("Calls", justify="right")
+    t.add_column("Hit %", justify="right")
+    t.add_column("Spent", justify="right", no_wrap=True)
+    t.add_column("No-cache", justify="right", no_wrap=True)
+    t.add_column("Saved", justify="right", no_wrap=True)
+    for project, stats in sorted(project_stats.items(), key=lambda kv: -kv[1]["cost"])[: args.top]:
+        short = shorten_path(decode_project(project))
+        hr = stats["hit_rate"] * 100
+        hr_color = "green" if hr >= 80 else "yellow" if hr >= 50 else "red"
+        t.add_row(
+            short, str(stats["calls"]),
+            f"[{hr_color}]{hr:.0f}%[/{hr_color}]",
+            fmt_cost(stats["cost"]),
+            fmt_cost(stats["uncached_cost"]),
+            f"[green]{fmt_cost(stats['savings'])}[/green]",
+        )
+    console.print(t)
+
+
+def cmd_report(args) -> None:
+    """Export a comprehensive dashboard to HTML or SVG."""
+    if not RICH:
+        print("Report export requires `pip install rich`.", file=sys.stderr)
+        sys.exit(1)
+    width = args.width
+    console = Console(record=True, width=width, force_terminal=True, color_system="truecolor")
+
+    # Temporarily swap the Console the render_* helpers use.
+    # The cmd_* handlers create their own Console(), so we inline-render here.
+    records = load_all()
+    if not records:
+        console.print("No records to report.")
+    else:
+        console.rule(f"[bold]Claude Code Usage Report — {datetime.now():%Y-%m-%d %H:%M}[/bold]")
+
+        # Section 1: overall summary
+        total = empty_agg()
+        for r in records:
+            u = r.usage
+            total["in"]   += int(u.get("input_tokens") or 0)
+            total["out"]  += int(u.get("output_tokens") or 0)
+            total["cr"]   += int(u.get("cache_read_input_tokens") or 0)
+            total["cw"]   += int(u.get("cache_creation_input_tokens") or 0)
+            total["cost"] += r.cost
+            total["calls"] += 1
+        sessions = {r.session_id for r in records if r.session_id}
+        projects_set = {r.project for r in records if r.project}
+        console.print(
+            f"\n[bold]Overview[/bold]  "
+            f"sessions: [cyan]{len(sessions)}[/cyan]  "
+            f"projects: [magenta]{len(projects_set)}[/magenta]  "
+            f"calls: [cyan]{total['calls']}[/cyan]  "
+            f"total cost: [green]{fmt_cost(total['cost'])}[/green]"
+        )
+
+        by_model = aggregate(records, lambda r: r.model)
+        t = Table(title="By Model", box=box.SIMPLE_HEAVY)
+        t.add_column("Model"); t.add_column("Calls", justify="right")
+        t.add_column("Input", justify="right"); t.add_column("Output", justify="right")
+        t.add_column("Cache R", justify="right"); t.add_column("Cache W", justify="right")
+        t.add_column("Cost", justify="right")
+        for model, a in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
+            t.add_row(model, str(a["calls"]),
+                      fmt_num(a["in"]), fmt_num(a["out"]),
+                      fmt_num(a["cr"]), fmt_num(a["cw"]),
+                      fmt_cost(a["cost"]))
+        console.print(t)
+
+        # Section 2: daily (last 30)
+        by_day = aggregate(
+            records,
+            lambda r: parse_ts(r.timestamp).date().isoformat() if parse_ts(r.timestamp) else None,
+        )
+        days = sorted(by_day.keys(), reverse=True)[:30]
+        t = Table(title=f"Daily (last {len(days)})", box=box.SIMPLE_HEAVY)
+        t.add_column("Date"); t.add_column("Calls", justify="right")
+        t.add_column("Input", justify="right"); t.add_column("Output", justify="right")
+        t.add_column("Cache R", justify="right"); t.add_column("Cache W", justify="right")
+        t.add_column("Cost", justify="right")
+        for d in days:
+            a = by_day[d]
+            t.add_row(d, str(a["calls"]),
+                      fmt_num(a["in"]), fmt_num(a["out"]),
+                      fmt_num(a["cr"]), fmt_num(a["cw"]),
+                      fmt_cost(a["cost"]))
+        console.print(t)
+
+        # Section 3: top projects
+        by_project = aggregate(records, lambda r: r.project)
+        t = Table(title="Top 15 Projects", box=box.SIMPLE_HEAVY)
+        t.add_column("Project"); t.add_column("Calls", justify="right")
+        t.add_column("Cost", justify="right"); t.add_column("Last active")
+        for project, a in sorted(by_project.items(), key=lambda kv: -kv[1]["cost"])[:15]:
+            last = a["last"].strftime("%Y-%m-%d") if a["last"] else "-"
+            t.add_row(shorten_path(decode_project(project)), str(a["calls"]),
+                      fmt_cost(a["cost"]), last)
+        console.print(t)
+
+        # Section 4: heatmap
+        grid = [[0.0] * 24 for _ in range(7)]
+        for r in records:
+            ts = parse_ts(r.timestamp)
+            if ts is None:
+                continue
+            local = ts.astimezone()
+            grid[local.weekday()][local.hour] += r.cost
+        peak = max(max(row) for row in grid) or 1.0
+        console.print(f"\n[bold]Usage Heatmap (cost, local time)[/bold]")
+        hour_ones = "".join(str(h % 10) for h in range(24))
+        console.print(f"       {hour_ones}")
+        dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        for dow in range(7):
+            cells = "".join(_heat_cell(grid[dow][h] / peak) for h in range(24))
+            console.print(f"  [bold]{dow_labels[dow]}[/bold]  {cells}")
+
+    # Save
+    out = args.output or f"claude-usage-{date.today().isoformat()}.{args.format}"
+    if args.format == "html":
+        console.save_html(out, inline_styles=True)
+    elif args.format == "svg":
+        console.save_svg(out, title="Claude Code Usage Report")
+    elif args.format == "txt":
+        console.save_text(out)
+    else:
+        print(f"Unknown format: {args.format}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Wrote report -> {out}", file=sys.stderr)
+    if args.format == "html":
+        print("Open in a browser and use File > Print > Save as PDF for a PDF copy.",
+              file=sys.stderr)
+
+
 def cmd_activity(args) -> None:
     """Per-day engagement: unique sessions active, unique projects touched."""
     records = load_all()
@@ -867,6 +1209,21 @@ def main() -> None:
     pa = sub.add_parser("activity", help="Per-day unique sessions & projects active (engagement)")
     pa.add_argument("--days", type=int, default=30, help="Limit to last N active days (0 = all)")
 
+    pw = sub.add_parser("weekly", help="Per-ISO-week usage (Mon-Sun buckets)")
+    pw.add_argument("--weeks", type=int, default=12, help="Last N weeks (default 12)")
+
+    pc = sub.add_parser("calendar", help="GitHub-style yearly activity grid")
+    pc.add_argument("--year", type=int, help="Year to show (default: current year)")
+    pc.add_argument("--metric", choices=["cost", "calls"], default="cost")
+
+    pca = sub.add_parser("cache", help="Cache hit rate and estimated savings per project")
+    pca.add_argument("--top", type=int, default=15)
+
+    pr = sub.add_parser("report", help="Export a full dashboard (HTML/SVG/TXT)")
+    pr.add_argument("--format", choices=["html", "svg", "txt"], default="html")
+    pr.add_argument("--output", "-o", help="Output path (default: claude-usage-<date>.<ext>)")
+    pr.add_argument("--width", type=int, default=140, help="Render width in columns")
+
     pb = sub.add_parser("budget", help="Check spend vs daily/monthly limits")
     pb.add_argument("--daily", type=float, help="Daily budget in USD, e.g. 10")
     pb.add_argument("--monthly", type=float, help="Monthly budget in USD, e.g. 200")
@@ -886,6 +1243,10 @@ def main() -> None:
         "heatmap":  cmd_heatmap,
         "trend":    cmd_trend,
         "activity": cmd_activity,
+        "weekly":   cmd_weekly,
+        "calendar": cmd_calendar,
+        "cache":    cmd_cache,
+        "report":   cmd_report,
         "budget":   cmd_budget,
     }
     handlers[args.cmd](args)
