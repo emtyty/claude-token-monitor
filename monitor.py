@@ -115,6 +115,36 @@ class Record:
     cost: float
     cwd: str
     msg_id: str
+    tools: list = None  # list[str] of tool names used in this assistant turn
+    read_paths: list = None  # list[str] of file_path args passed to the Read tool
+
+    def __post_init__(self):
+        if self.tools is None:
+            self.tools = []
+        if self.read_paths is None:
+            self.read_paths = []
+
+
+def _extract_tool_info(msg: dict) -> tuple[list[str], list[str]]:
+    """Return (tool_names, read_paths) from an assistant message."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return [], []
+    tools: list[str] = []
+    paths: list[str] = []
+    for c in content:
+        if not isinstance(c, dict) or c.get("type") != "tool_use":
+            continue
+        name = c.get("name") or ""
+        if name:
+            tools.append(name)
+        if name == "Read":
+            inp = c.get("input")
+            if isinstance(inp, dict):
+                fp = inp.get("file_path")
+                if fp:
+                    paths.append(fp)
+    return tools, paths
 
 
 def iter_records(root: Path) -> Iterator[Record]:
@@ -122,11 +152,14 @@ def iter_records(root: Path) -> Iterator[Record]:
 
     Multiple JSONL entries share the same message.id when an assistant
     turn has several content blocks. Their `usage` block is the full
-    per-call total and is duplicated — so we dedupe by (session, msg_id).
+    per-call total and is duplicated — so we dedupe by (session, msg_id)
+    and accumulate tool_use blocks across entries with the same id.
     """
     if not root.exists():
         return
-    seen: set[tuple[str, str]] = set()
+
+    # key -> {"tools": [...], "read_paths": [...], "base": Record-kwargs or None}
+    partial: dict[tuple[str, str], dict] = {}
     for project_dir in root.iterdir():
         if not project_dir.is_dir():
             continue
@@ -147,26 +180,39 @@ def iter_records(root: Path) -> Iterator[Record]:
                     if e.get("type") != "assistant":
                         continue
                     msg = e.get("message") or {}
-                    usage = msg.get("usage")
-                    if not usage:
-                        continue
                     msg_id = msg.get("id") or ""
                     session_id = e.get("sessionId") or ""
                     key = (session_id, msg_id)
-                    if msg_id and key in seen:
-                        continue
-                    seen.add(key)
-                    model = msg.get("model") or "unknown"
-                    yield Record(
-                        project=project_dir.name,
-                        session_id=session_id,
-                        timestamp=e.get("timestamp") or "",
-                        model=model,
-                        usage=usage,
-                        cost=calc_cost(usage, model),
-                        cwd=e.get("cwd") or "",
-                        msg_id=msg_id,
-                    )
+
+                    info = partial.get(key)
+                    if info is None:
+                        info = {"tools": [], "read_paths": [], "base": None}
+                        partial[key] = info
+
+                    t, p = _extract_tool_info(msg)
+                    info["tools"].extend(t)
+                    info["read_paths"].extend(p)
+
+                    if info["base"] is None:
+                        usage = msg.get("usage")
+                        if usage:
+                            model = msg.get("model") or "unknown"
+                            info["base"] = {
+                                "project": project_dir.name,
+                                "session_id": session_id,
+                                "timestamp": e.get("timestamp") or "",
+                                "model": model,
+                                "usage": usage,
+                                "cost": calc_cost(usage, model),
+                                "cwd": e.get("cwd") or "",
+                                "msg_id": msg_id,
+                            }
+
+    for info in partial.values():
+        base = info["base"]
+        if base is None:
+            continue
+        yield Record(**base, tools=info["tools"], read_paths=info["read_paths"])
 
 
 def empty_agg() -> dict:
@@ -970,6 +1016,12 @@ def cmd_report(args) -> None:
             cells = "".join(_heat_cell(grid[dow][h] / peak) for h in range(24))
             console.print(f"  [bold]{dow_labels[dow]}[/bold]  {cells}")
 
+        # Section 5: suggestions
+        console.print()
+        console.rule("[bold]Efficiency Suggestions[/bold]")
+        suggestions = analyze_suggestions(records)
+        _render_suggestions(console, suggestions, top=15)
+
     # Save
     out = args.output or f"claude-usage-{date.today().isoformat()}.{args.format}"
     if args.format == "html":
@@ -1093,6 +1145,522 @@ def cmd_activity(args) -> None:
         f"[bold]avg projects/day:[/bold] {avg_proj_per_day:.1f}  "
         f"[bold]cost:[/bold] [green]{fmt_cost(sum(cost_series))}[/green]"
     )
+
+
+# ------------------------------ Suggestions ---------------------------- #
+
+
+@dataclass
+class Suggestion:
+    rule: str            # short rule id
+    severity: str        # "high" | "med" | "low"
+    scope: str           # e.g. "project ~/Code/foo", "session abc12345", "day 2026-04-18"
+    evidence: str        # one-line factual evidence
+    action: str          # concrete recommendation
+    est_savings: float   # USD; 0.0 if not quantified
+
+
+# Opus -> Sonnet swap saves ~80% (matches uniform Sonnet/Opus price ratio of ~0.2
+# across input, output, cache-read and cache-write).
+_OPUS_TO_SONNET_SAVINGS = 0.80
+
+# ast-graph language coverage (https://github.com/emtyty/ast-graph).
+_ASTGRAPH_EXTS = {".rs", ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+                  ".cs", ".java"}
+
+# Tool classification for plan/explore detection.
+_EXPLORE_TOOLS = {"Read", "Grep", "Glob", "WebFetch", "WebSearch", "LSP",
+                  "NotebookRead", "Agent", "Task"}
+_MUTATE_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
+
+
+def _is_opus(model: str) -> bool:
+    return "opus" in (model or "").lower()
+
+
+def _is_sonnet(model: str) -> bool:
+    return "sonnet" in (model or "").lower()
+
+
+def _project_lang_supported(records: list[Record]) -> bool:
+    """Return True if the project's Read tool targets mostly ast-graph-supported files."""
+    paths = [p for r in records for p in r.read_paths]
+    if not paths:
+        return False
+    supported = 0
+    for p in paths:
+        ext = Path(p).suffix.lower()
+        if ext in _ASTGRAPH_EXTS:
+            supported += 1
+    return supported / len(paths) >= 0.5
+
+
+def _short_scope_project(project: str) -> str:
+    return f"project {shorten_path(decode_project(project))}"
+
+
+def _rule_opus_heavy_project(records: list[Record]) -> list[Suggestion]:
+    """Rule 1: project where Opus dominates cost but avg output is small (routine edits)."""
+    by_project: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        by_project[r.project].append(r)
+    out: list[Suggestion] = []
+    for project, recs in by_project.items():
+        total_cost = sum(r.cost for r in recs)
+        if total_cost < 10:
+            continue
+        opus_recs = [r for r in recs if _is_opus(r.model)]
+        opus_cost = sum(r.cost for r in opus_recs)
+        if not opus_recs or opus_cost / total_cost < 0.6:
+            continue
+        opus_out = sum(int(r.usage.get("output_tokens") or 0) for r in opus_recs)
+        avg_output = opus_out / len(opus_recs)
+        if avg_output >= 500 or len(opus_recs) < 20:
+            continue
+        savings = opus_cost * _OPUS_TO_SONNET_SAVINGS
+        severity = "high" if savings >= 50 else "med" if savings >= 10 else "low"
+        out.append(Suggestion(
+            rule="opus-heavy-project",
+            severity=severity,
+            scope=_short_scope_project(project),
+            evidence=(
+                f"Opus {fmt_cost(opus_cost)} / {len(opus_recs)} calls · "
+                f"avg output {int(avg_output)} tok · "
+                f"Opus share {opus_cost/total_cost*100:.0f}%"
+            ),
+            action=(
+                "Set default model to Sonnet for this project "
+                "(routine edits don't need Opus reasoning)."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_opus_routine_session(records: list[Record]) -> list[Suggestion]:
+    """Rule 2: long all-Opus session with small outputs (routine edits)."""
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        if len(recs) < 20:
+            continue
+        if not all(_is_opus(r.model) for r in recs):
+            continue
+        cost = sum(r.cost for r in recs)
+        if cost < 5:
+            continue
+        total_out = sum(int(r.usage.get("output_tokens") or 0) for r in recs)
+        avg_out = total_out / len(recs)
+        if avg_out >= 500:
+            continue
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        savings = cost * _OPUS_TO_SONNET_SAVINGS
+        severity = "high" if savings >= 30 else "med" if savings >= 5 else "low"
+        out.append(Suggestion(
+            rule="opus-routine-session",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{len(recs)} calls · all Opus · "
+                f"avg output {int(avg_out)} tok · {fmt_cost(cost)}"
+            ),
+            action="Rerun this kind of work on Sonnet — outputs were small, likely routine.",
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_low_cache_hit(records: list[Record]) -> list[Suggestion]:
+    """Rule 3: spendy project with low cache hit rate."""
+    by_project: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        by_project[r.project].append(r)
+    out: list[Suggestion] = []
+    for project, recs in by_project.items():
+        cost = sum(r.cost for r in recs)
+        if cost < 10:
+            continue
+        inp = sum(int(r.usage.get("input_tokens") or 0) for r in recs)
+        cr  = sum(int(r.usage.get("cache_read_input_tokens") or 0) for r in recs)
+        cw  = sum(int(r.usage.get("cache_creation_input_tokens") or 0) for r in recs)
+        denom = inp + cr + cw
+        if denom == 0:
+            continue
+        hit = cr / denom
+        if hit >= 0.4:
+            continue
+        # Rough: if hit rate rose to 80%, cache-read cost is ~1/10 of raw input at
+        # same token count. Assume half of current uncached input-side tokens could
+        # have been cache-reads instead.
+        savings = 0.0
+        for r in recs:
+            p = model_price(r.model)
+            raw_in = int(r.usage.get("input_tokens") or 0)
+            shiftable = raw_in * 0.5
+            savings += shiftable * (p["in"] - p["cr"]) / 1_000_000
+        severity = "med" if savings >= 5 else "low"
+        out.append(Suggestion(
+            rule="low-cache-hit",
+            severity=severity,
+            scope=_short_scope_project(project),
+            evidence=f"cache hit {hit*100:.0f}% · {fmt_cost(cost)} spent · many short sessions likely",
+            action=(
+                "Keep related work in one session; avoid frequent `/clear`. "
+                "Each new session rebuilds the prefix cache."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_raw_input_spike(records: list[Record]) -> list[Suggestion]:
+    """Rule 4: individual calls with huge raw input_tokens (log/diff dumps)."""
+    # Aggregate per project: total raw-input tokens in "spike" calls (>50K single call).
+    by_project: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        raw = int(r.usage.get("input_tokens") or 0)
+        if raw >= 50_000:
+            by_project[r.project].append(r)
+    out: list[Suggestion] = []
+    for project, spikes in by_project.items():
+        if len(spikes) < 3:
+            continue
+        spike_tokens = sum(int(r.usage.get("input_tokens") or 0) for r in spikes)
+        # ZeroCTX compresses build/test/diff output; assume ~60% reduction on spike tokens.
+        savings = 0.0
+        for r in spikes:
+            p = model_price(r.model)
+            raw = int(r.usage.get("input_tokens") or 0)
+            savings += raw * 0.6 * p["in"] / 1_000_000
+        severity = "high" if savings >= 20 else "med" if savings >= 5 else "low"
+        max_raw = max(int(r.usage.get("input_tokens") or 0) for r in spikes)
+        out.append(Suggestion(
+            rule="raw-input-spike",
+            severity=severity,
+            scope=_short_scope_project(project),
+            evidence=(
+                f"{len(spikes)} calls with >50K raw input · "
+                f"peak {fmt_num(max_raw)} · {fmt_num(spike_tokens)} total"
+            ),
+            action=(
+                "Pipe build/test/diff commands through `zero rewrite-exec -- …` "
+                "so ZeroCTX compresses noisy stdout before it hits Claude's context."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_day_spike(records: list[Record]) -> list[Suggestion]:
+    """Rule 5: day cost > 3× median of the last 30 active days."""
+    by_day: dict[str, float] = defaultdict(float)
+    for r in records:
+        ts = parse_ts(r.timestamp)
+        if ts is None:
+            continue
+        by_day[ts.astimezone().date().isoformat()] += r.cost
+    if len(by_day) < 7:
+        return []
+    days = sorted(by_day.keys())[-30:]
+    costs = sorted(by_day[d] for d in days if by_day[d] > 0)
+    if not costs:
+        return []
+    median = costs[len(costs) // 2]
+    out: list[Suggestion] = []
+    for d in days:
+        c = by_day[d]
+        if median <= 0 or c < median * 3 or c < 20:
+            continue
+        severity = "high" if c >= 100 else "med"
+        out.append(Suggestion(
+            rule="day-spike",
+            severity=severity,
+            scope=f"day {d}",
+            evidence=(
+                f"{fmt_cost(c)} on {d} · "
+                f"{c/median:.1f}× median ({fmt_cost(median)})"
+            ),
+            action=(
+                "Investigate this day's top session — likely a runaway context or "
+                "a long session that would have benefited from `/clear` + resume."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+def _rule_session_fragmentation(records: list[Record]) -> list[Suggestion]:
+    """Rule 6: many short sessions on same project same day → cache rebuilt repeatedly."""
+    # bucket: (project, day) -> list[session_id -> call_count]
+    buckets: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    cw_cost: dict[tuple[str, str], float] = defaultdict(float)
+    for r in records:
+        ts = parse_ts(r.timestamp)
+        if ts is None or not r.session_id:
+            continue
+        day = ts.astimezone().date().isoformat()
+        key = (r.project, day)
+        buckets[key][r.session_id] += 1
+        p = model_price(r.model)
+        cw = int(r.usage.get("cache_creation_input_tokens") or 0)
+        cw_cost[key] += cw * p["cw"] / 1_000_000
+    out: list[Suggestion] = []
+    for (project, day), sess_counts in buckets.items():
+        short_sess = [s for s, n in sess_counts.items() if n < 5]
+        if len(short_sess) < 3:
+            continue
+        if len(sess_counts) < 4:
+            continue
+        # savings ceiling: the cache-write cost that's roughly proportional to
+        # session starts (each new session re-writes the prefix cache).
+        total_cw = cw_cost[(project, day)]
+        savings = total_cw * len(short_sess) / max(1, len(sess_counts)) * 0.5
+        severity = "med" if savings >= 3 else "low"
+        out.append(Suggestion(
+            rule="session-fragmentation",
+            severity=severity,
+            scope=f"{_short_scope_project(project)} on {day}",
+            evidence=(
+                f"{len(sess_counts)} sessions ({len(short_sess)} with <5 calls) · "
+                f"cache-write {fmt_cost(total_cw)}"
+            ),
+            action=(
+                "Keep related work in a single session; starting fresh for every "
+                "small task pays the cache-write cost again."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_cache_rebuild(records: list[Record]) -> list[Suggestion]:
+    """Rule 7: session with cache_write ≫ cache_read (context kept getting rebuilt)."""
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        if len(recs) < 10:
+            continue
+        cost = sum(r.cost for r in recs)
+        if cost < 5:
+            continue
+        cr = sum(int(r.usage.get("cache_read_input_tokens") or 0) for r in recs)
+        cw = sum(int(r.usage.get("cache_creation_input_tokens") or 0) for r in recs)
+        if cr == 0 or cw / cr < 0.2:
+            continue
+        # savings: assume healthy sessions sit at cw/cr ~0.05; excess cw is waste.
+        excess_cw = cw - cr * 0.05
+        if excess_cw <= 0:
+            continue
+        # price the excess at average per-token cw rate for the session
+        total_cost_cw = sum(
+            int(r.usage.get("cache_creation_input_tokens") or 0)
+            * model_price(r.model)["cw"] / 1_000_000
+            for r in recs
+        )
+        rate = total_cost_cw / max(1, cw)
+        savings = excess_cw * rate
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        severity = "med" if savings >= 5 else "low"
+        out.append(Suggestion(
+            rule="cache-rebuild",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{len(recs)} calls · cache-write/read ratio {cw/cr:.2f} "
+                f"(healthy <0.1) · {fmt_cost(cost)}"
+            ),
+            action=(
+                "Context thrashed — likely long session with growing history. "
+                "Break into smaller tasks with `/clear` between unrelated goals."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_many_reads(records: list[Record]) -> list[Suggestion]:
+    """Rule 8: session with many Read calls on ast-graph-supported languages."""
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        cost = sum(r.cost for r in recs)
+        if cost < 5:
+            continue
+        all_tools = [t for r in recs for t in r.tools]
+        if not all_tools:
+            continue
+        reads = sum(1 for t in all_tools if t == "Read")
+        if reads < 30:
+            continue
+        if reads / len(all_tools) < 0.4:
+            continue
+        if not _project_lang_supported(recs):
+            continue
+        # savings: treat ~40% of the read-heavy portion as potentially avoidable.
+        input_cost = sum(
+            (int(r.usage.get("input_tokens") or 0)
+             + int(r.usage.get("cache_read_input_tokens") or 0))
+            * model_price(r.model)["cr"] / 1_000_000
+            for r in recs
+        )
+        savings = input_cost * 0.4
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        severity = "med" if savings >= 3 else "low"
+        out.append(Suggestion(
+            rule="many-reads",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{reads} Read calls ({reads*100//len(all_tools)}% of tool use) · "
+                f"{fmt_cost(cost)}"
+            ),
+            action=(
+                "Use ast-graph (`scan` + `symbol`/`blast-radius`) for structural "
+                "lookups — one query replaces many whole-file Reads."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+def _rule_explore_on_opus(records: list[Record]) -> list[Suggestion]:
+    """Rule 9: Opus session dominated by exploration tools (plan/analysis mode)."""
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        if len(recs) < 10:
+            continue
+        opus_recs = [r for r in recs if _is_opus(r.model)]
+        if len(opus_recs) / len(recs) < 0.7:
+            continue
+        cost = sum(r.cost for r in recs)
+        if cost < 5:
+            continue
+        all_tools = [t for r in recs for t in r.tools]
+        if not all_tools:
+            continue
+        explore = sum(1 for t in all_tools if t in _EXPLORE_TOOLS)
+        mutate = sum(1 for t in all_tools if t in _MUTATE_TOOLS)
+        if explore + mutate == 0:
+            continue
+        if explore / (explore + mutate) < 0.85:
+            continue
+        opus_cost = sum(r.cost for r in opus_recs)
+        savings = opus_cost * _OPUS_TO_SONNET_SAVINGS
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        lang_ok = _project_lang_supported(recs)
+        action = (
+            "Exploration on Opus is expensive — plan/analyze on Sonnet (or Haiku), "
+            "switch to Opus only for synthesis/implementation."
+        )
+        if lang_ok:
+            action += (
+                " Pair with ast-graph for structural queries instead of Read-spray."
+            )
+        severity = "high" if savings >= 20 else "med" if savings >= 5 else "low"
+        out.append(Suggestion(
+            rule="explore-on-opus",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{len(recs)} calls · {len(opus_recs)} Opus · "
+                f"{explore*100//(explore+mutate)}% explore tools · {fmt_cost(cost)}"
+            ),
+            action=action,
+            est_savings=savings,
+        ))
+    return out
+
+
+def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
+    rules = [
+        _rule_opus_heavy_project,
+        _rule_opus_routine_session,
+        _rule_low_cache_hit,
+        _rule_raw_input_spike,
+        _rule_day_spike,
+        _rule_session_fragmentation,
+        _rule_cache_rebuild,
+        _rule_many_reads,
+        _rule_explore_on_opus,
+    ]
+    out: list[Suggestion] = []
+    for rule in rules:
+        out.extend(rule(records))
+    sev_order = {"high": 0, "med": 1, "low": 2}
+    out.sort(key=lambda s: (sev_order.get(s.severity, 9), -s.est_savings))
+    return out
+
+
+def _render_suggestions(console, suggestions: list[Suggestion], top: int) -> None:
+    if not suggestions:
+        console.print("[green]No efficiency issues detected — looking clean.[/green]")
+        return
+    total_savings = sum(s.est_savings for s in suggestions)
+    console.print(
+        f"[bold]Suggestions[/bold]  "
+        f"found: [cyan]{len(suggestions)}[/cyan]  "
+        f"est. potential savings: [green]{fmt_cost(total_savings)}[/green]"
+    )
+    t = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+    t.add_column("Sev", no_wrap=True)
+    t.add_column("Rule", no_wrap=True)
+    t.add_column("Scope", overflow="ellipsis")
+    t.add_column("Evidence", overflow="fold")
+    t.add_column("Save", justify="right", no_wrap=True)
+    t.add_column("Action", overflow="fold")
+    colors = {"high": "red", "med": "yellow", "low": "cyan"}
+    for s in suggestions[:top]:
+        c = colors.get(s.severity, "white")
+        save_cell = fmt_cost(s.est_savings) if s.est_savings > 0 else "[dim]—[/dim]"
+        t.add_row(
+            f"[bold {c}]{s.severity}[/bold {c}]",
+            s.rule,
+            s.scope,
+            s.evidence,
+            save_cell,
+            s.action,
+        )
+    console.print(t)
+
+
+def cmd_suggest(args) -> None:
+    records = load_all()
+    if not records:
+        print("No records.")
+        return
+    suggestions = analyze_suggestions(records)
+    if args.min_savings > 0:
+        suggestions = [
+            s for s in suggestions
+            if s.est_savings >= args.min_savings or s.est_savings == 0
+        ]
+    if not RICH:
+        for s in suggestions[: args.top]:
+            save = f"~{fmt_cost(s.est_savings)}" if s.est_savings > 0 else "-"
+            print(f"[{s.severity.upper():4s}] {s.rule:22s} {s.scope}")
+            print(f"       {s.evidence}")
+            print(f"       save: {save}   → {s.action}")
+        return
+    console = Console()
+    console.rule("[bold]Claude Code — Efficiency Suggestions[/bold]")
+    _render_suggestions(console, suggestions, args.top)
 
 
 def cmd_budget(args) -> None:
@@ -1224,6 +1792,11 @@ def main() -> None:
     pr.add_argument("--output", "-o", help="Output path (default: claude-usage-<date>.<ext>)")
     pr.add_argument("--width", type=int, default=140, help="Render width in columns")
 
+    psg = sub.add_parser("suggest", help="Detect inefficient usage patterns and suggest savings")
+    psg.add_argument("--top", type=int, default=20, help="Max suggestions to show (default 20)")
+    psg.add_argument("--min-savings", type=float, default=0.0,
+                     help="Hide quantified suggestions with est. savings below $X")
+
     pb = sub.add_parser("budget", help="Check spend vs daily/monthly limits")
     pb.add_argument("--daily", type=float, help="Daily budget in USD, e.g. 10")
     pb.add_argument("--monthly", type=float, help="Monthly budget in USD, e.g. 200")
@@ -1247,6 +1820,7 @@ def main() -> None:
         "calendar": cmd_calendar,
         "cache":    cmd_cache,
         "report":   cmd_report,
+        "suggest":  cmd_suggest,
         "budget":   cmd_budget,
     }
     handlers[args.cmd](args)

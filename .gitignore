@@ -8,4 +8,6 @@ venv/
 # Exported reports (these are user data, not source)
 *.csv
 *.json
+*.html
+*.svg
 !requirements.json
