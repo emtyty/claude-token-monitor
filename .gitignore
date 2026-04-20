@@ -9,3 +9,8 @@ venv/
 *.csv
 *.json
 !requirements.json
+.gitnexus
+
+# MemPalace per-project files (issue #185)
+mempalace.yaml
+entities.json
