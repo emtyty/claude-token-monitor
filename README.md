@@ -38,6 +38,7 @@ python monitor.py <command> [options]
 | `trend <project> [--days N]` | Daily trend for one project (substring match) |
 | `activity [--days N]` | Per-day unique sessions & projects active + top project of each day |
 | `cache [--top N]` | Cache hit rate + estimated savings per project |
+| `suggest [--top N] [--min-savings USD]` | Detect inefficient usage patterns and suggest savings |
 | `budget [--daily USD] [--monthly USD] [--warn-at 0.8] [--strict]` | Today + MTD spend vs limits |
 | `live [--interval S]` | Auto-refreshing dashboard |
 | `export --format csv\|json [-o path]` | Raw per-call records |
@@ -83,6 +84,10 @@ python monitor.py calendar --year 2026
 # Cache efficiency — how much did caching save you?
 python monitor.py cache
 
+# What could you be doing more efficiently? (Opus-when-Sonnet-would-do, log-dumps, day spikes, …)
+python monitor.py suggest
+python monitor.py suggest --top 10 --min-savings 5
+
 # Export full dashboard to HTML (then browser Print -> Save as PDF)
 python monitor.py report --format html -o usage-report.html
 
@@ -104,6 +109,43 @@ one-file tool. Instead:
 3. Use **File > Print > Save as PDF** (Chrome, Edge, Firefox all support this).
 
 This is typically sharper than library-rendered PDF, and needs no extra install.
+
+## Suggestions engine
+
+`suggest` runs 9 rules over your logs and flags concrete, dollar-quantified
+recommendations. The same output is appended to `report --format html` as an
+"Efficiency Suggestions" section.
+
+| Rule | Fires when | Recommendation |
+|---|---|---|
+| `opus-heavy-project` | Opus ≥ 60% of project cost, avg output < 500 tok, ≥ 20 Opus calls | Default the project to Sonnet — routine edits don't need Opus |
+| `opus-routine-session` | Session ≥ 20 calls, all-Opus, avg output < 500 tok | Rerun this kind of work on Sonnet |
+| `low-cache-hit` | Project cost > $10, cache hit rate < 40% | Keep related work in one session; avoid frequent `/clear` |
+| `raw-input-spike` | ≥ 3 calls with > 50K raw input tokens (build/diff dumps) | Pipe commands through [`zero rewrite-exec`](https://github.com/emtyty/zeroctx) to compress stdout |
+| `day-spike` | Day cost > 3× median of last 30 active days | Investigate that day's top session for runaway context |
+| `session-fragmentation` | ≥ 3 short sessions (< 5 calls each) on same project same day | Consolidate; each fresh session pays cache-write again |
+| `cache-rebuild` | Session `cache_write / cache_read` > 0.2 | Long session with growing history — split with `/clear` |
+| `many-reads` | Session ≥ 30 Read calls, ≥ 40% of tool use, supported language | Use [ast-graph](https://github.com/emtyty/ast-graph) `symbol` / `blast-radius` instead of whole-file Reads |
+| `explore-on-opus` | Session ≥ 70% Opus, ≥ 85% exploration tools (Read/Grep/Glob/…) | Plan/analyze on Sonnet or Haiku; Opus only for synthesis. Pairs well with ast-graph |
+| `plan-mode-opus` | Session used `ExitPlanMode` **and** ≥ 70% Opus | Draft the plan on Sonnet; feed ast-graph `symbol`/`hotspots`/`blast-radius`/`dead-code` into the plan instead of Read/Grep-mapping by hand |
+
+Rules 8, 9 and 10 check the project's `Read` file extensions against
+ast-graph's supported languages (Rust, Python, JS/TS, C#, Java) — the
+ast-graph suggestion only appears when ≥ 50% of the reads land on
+supported files.
+
+Plan mode is detected from the JSONL logs via the `ExitPlanMode` tool
+call — Claude Code emits that tool when the user approves a plan, so its
+presence in a session is a reliable marker that planning happened there.
+
+Savings are estimated from Claude pricing: Opus → Sonnet saves ~80%
+across input, output, and cache tiers (the ratio is roughly uniform).
+ZeroCTX is assumed to compress spike stdout by ~60%. These are
+rules-of-thumb — treat the numbers as directional, not accounting.
+
+The `report --format html` export embeds the Suggestions table plus a
+footer repeating this methodology and linking the external tools, so a
+shared report is self-explanatory.
 
 ## Pricing
 

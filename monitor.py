@@ -1108,6 +1108,24 @@ def cmd_report(args) -> None:
         suggestions = analyze_suggestions(records)
         _render_suggestions(console, suggestions, top=15)
 
+        console.print()
+        console.print(
+            "[dim]How savings are estimated: Opus → Sonnet ≈ 80% savings "
+            "(Sonnet is ~5× cheaper across input, output, and cache tiers). "
+            "ZeroCTX assumed to compress spike stdout by ~60%. "
+            "Directional only, not accounting.[/dim]"
+        )
+        console.print(
+            "[dim]External tools — "
+            "[link=https://github.com/emtyty/ast-graph]ast-graph[/link]: "
+            "structural code queries (symbol / hotspots / blast-radius / "
+            "dead-code) for Rust · Python · JS/TS · C# · Java — replaces "
+            "Read/Grep-spray during plan and analysis mode.  "
+            "ZeroCTX (`zero rewrite-exec -- <cmd>`): compresses noisy stdout "
+            "from cargo / npm / pytest / git diff before it reaches Claude's "
+            "context.[/dim]"
+        )
+
     # Save
     out = args.output or f"claude-usage-{date.today().isoformat()}.{args.format}"
     if args.format == "html":
@@ -1675,6 +1693,61 @@ def _rule_explore_on_opus(records: list[Record]) -> list[Suggestion]:
     return out
 
 
+def _rule_plan_mode_opus(records: list[Record]) -> list[Suggestion]:
+    """Rule 10: plan-mode session on Opus.
+
+    Detected via presence of the `ExitPlanMode` tool call in the session.
+    Plan/analysis drafts don't need Opus — ast-graph can replace much of
+    the structural exploration the planner has to do by hand.
+    """
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        tools = [t for r in recs for t in r.tools]
+        plan_turns = sum(1 for t in tools if t == "ExitPlanMode")
+        if plan_turns == 0:
+            continue
+        opus_recs = [r for r in recs if _is_opus(r.model)]
+        if not opus_recs or len(opus_recs) / len(recs) < 0.7:
+            continue
+        cost = sum(r.cost for r in recs)
+        if cost < 3:
+            continue
+        opus_cost = sum(r.cost for r in opus_recs)
+        # Assume ~half the session's Opus spend is planning/analysis that
+        # could run on Sonnet — conservative 40% estimate.
+        savings = opus_cost * 0.4
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        lang_ok = _project_lang_supported(recs)
+        action = (
+            "Plan mode on Opus — draft the plan on Sonnet/Haiku, switch to Opus "
+            "only for the implementation turns."
+        )
+        if lang_ok:
+            action += (
+                " Feed ast-graph `symbol` / `hotspots` / `blast-radius` / "
+                "`dead-code` output into the plan instead of letting Claude "
+                "Read/Grep the codebase to discover structure."
+            )
+        severity = "high" if savings >= 20 else "med" if savings >= 5 else "low"
+        out.append(Suggestion(
+            rule="plan-mode-opus",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{len(recs)} calls · {plan_turns} plan-mode turn(s) · "
+                f"{len(opus_recs)} Opus · {fmt_cost(cost)}"
+            ),
+            action=action,
+            est_savings=savings,
+        ))
+    return out
+
+
 def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
     rules = [
         _rule_opus_heavy_project,
@@ -1686,6 +1759,7 @@ def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
         _rule_cache_rebuild,
         _rule_many_reads,
         _rule_explore_on_opus,
+        _rule_plan_mode_opus,
     ]
     out: list[Suggestion] = []
     for rule in rules:
