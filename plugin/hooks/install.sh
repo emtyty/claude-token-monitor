@@ -10,8 +10,6 @@ AGENT_SRC="$PLUGIN_DIR/agents/routine-worker.md"
 AGENT_DST="$CLAUDE_HOME/agents/routine-worker.md"
 TIER_BLOCK="$PLUGIN_DIR/CLAUDE-tier-routing.md"
 CLAUDE_MD="$CLAUDE_HOME/CLAUDE.md"
-MARKER_START="<!-- claude-token-monitor:tier-routing:start -->"
-MARKER_END="<!-- claude-token-monitor:tier-routing:end -->"
 
 say() { printf "  %s\n" "$*"; }
 
@@ -47,46 +45,42 @@ else
     say "✓ symlink created: $AGENT_DST → $AGENT_SRC"
 fi
 
-# 3. Install/refresh tier-routing block in ~/.claude/CLAUDE.md.
-echo "Installing tier-routing directive in $CLAUDE_MD..."
+# 3. Install tier-routing as a standalone file, @imported from CLAUDE.md.
+#    Non-destructive: never rewrites user's CLAUDE.md — only appends one
+#    @import line once (idempotent via grep guard).
+TIER_FILE_NAME="claude-token-monitor-tier-routing.md"
+TIER_FILE_DST="$CLAUDE_HOME/$TIER_FILE_NAME"
+IMPORT_LINE="@$TIER_FILE_NAME"
+
+echo "Installing tier-routing file at $TIER_FILE_DST..."
 if [ ! -f "$TIER_BLOCK" ]; then
     say "✗ source not found: $TIER_BLOCK — abort"
     exit 1
 fi
+cp "$TIER_BLOCK" "$TIER_FILE_DST"
+say "✓ tier-routing block written to $TIER_FILE_DST"
+
+echo "Linking tier-routing into $CLAUDE_MD..."
 touch "$CLAUDE_MD"
-
-# Strip any existing managed block (between markers, inclusive).
-tmp="$(mktemp)"
-awk -v start="$MARKER_START" -v end="$MARKER_END" '
-    index($0, start)   { skip = 1 }
-    !skip              { print }
-    index($0, end)     { skip = 0 }
-' "$CLAUDE_MD" > "$tmp"
-
-# Trim trailing blank lines / whitespace from the stripped content
-# so re-runs produce a byte-stable file (no creeping blank lines).
-stripped="$(cat "$tmp")"
-while [ "${stripped%$'\n'}" != "$stripped" ] || [ "${stripped%[[:space:]]}" != "$stripped" ]; do
-    stripped="${stripped%$'\n'}"
-    stripped="${stripped%[[:space:]]}"
-done
-
-# Write: pre-existing content (if any) + one blank line + fresh block.
-if [ -n "$stripped" ]; then
-    {
-        printf '%s\n\n' "$stripped"
-        cat "$TIER_BLOCK"
-    } > "$CLAUDE_MD"
+if grep -Fxq "$IMPORT_LINE" "$CLAUDE_MD"; then
+    say "✓ @import already present — no change"
 else
-    cat "$TIER_BLOCK" > "$CLAUDE_MD"
+    # Append with a leading blank line if file is non-empty and doesn't end with one.
+    if [ -s "$CLAUDE_MD" ]; then
+        # Ensure trailing newline before appending.
+        tail -c1 "$CLAUDE_MD" | od -An -c | grep -q '\\n' || printf '\n' >> "$CLAUDE_MD"
+        printf '\n%s\n' "$IMPORT_LINE" >> "$CLAUDE_MD"
+    else
+        printf '%s\n' "$IMPORT_LINE" >> "$CLAUDE_MD"
+    fi
+    say "✓ appended '$IMPORT_LINE' to $CLAUDE_MD"
 fi
-rm -f "$tmp"
-say "✓ tier-routing block installed (managed between markers)"
 
 echo "Done."
 echo
 echo "Next steps:"
 echo "  • Open a new Claude Code session in any project — global routing is live."
-echo "  • To uninstall the tier block, remove the block between the"
-echo "    <!-- claude-token-monitor:tier-routing:* --> markers in $CLAUDE_MD."
+echo "  • To uninstall the tier block:"
+echo "      rm $TIER_FILE_DST"
+echo "      then remove the '$IMPORT_LINE' line from $CLAUDE_MD"
 echo "  • To uninstall the agent: rm $AGENT_DST"
