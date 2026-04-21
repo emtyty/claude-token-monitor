@@ -54,21 +54,22 @@ Copy-Item $TierBlock $TierFileDst -Force
 Write-Host "  v tier-routing block written to $TierFileDst"
 
 Write-Host "Linking tier-routing into $ClaudeMd..."
-if (-not (Test-Path $ClaudeMd)) { New-Item -ItemType File -Path $ClaudeMd -Force | Out-Null }
-
-$existingLines = Get-Content $ClaudeMd -ErrorAction SilentlyContinue
-if ($existingLines | Where-Object { $_ -eq $ImportLine }) {
-    Write-Host "  v @import already present - no change"
+if (-not (Test-Path $ClaudeMd)) {
+    Set-Content -Path $ClaudeMd -Value $ImportLine
+    Write-Host "  v created $ClaudeMd with '$ImportLine'"
+} elseif ((Get-Item $ClaudeMd).Length -eq 0) {
+    Set-Content -Path $ClaudeMd -Value $ImportLine
+    Write-Host "  v wrote '$ImportLine' to empty $ClaudeMd"
 } else {
-    $content = Get-Content $ClaudeMd -Raw -ErrorAction SilentlyContinue
-    if ($null -ne $content -and $content.Length -gt 0) {
-        # Ensure trailing newline then append with a leading blank line.
+    $existingLines = Get-Content $ClaudeMd -ErrorAction SilentlyContinue
+    if ($existingLines | Where-Object { $_ -eq $ImportLine }) {
+        Write-Host "  v @import already present - no change"
+    } else {
+        $content = Get-Content $ClaudeMd -Raw
         if (-not $content.EndsWith("`n")) { Add-Content -Path $ClaudeMd -Value "" -NoNewline }
         Add-Content -Path $ClaudeMd -Value "`n$ImportLine"
-    } else {
-        Set-Content -Path $ClaudeMd -Value $ImportLine -NoNewline
+        Write-Host "  v appended '$ImportLine' to $ClaudeMd"
     }
-    Write-Host "  v appended '$ImportLine' to $ClaudeMd"
 }
 
 Write-Host "Done."

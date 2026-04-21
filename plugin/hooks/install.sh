@@ -61,18 +61,18 @@ cp "$TIER_BLOCK" "$TIER_FILE_DST"
 say "✓ tier-routing block written to $TIER_FILE_DST"
 
 echo "Linking tier-routing into $CLAUDE_MD..."
-touch "$CLAUDE_MD"
-if grep -Fxq "$IMPORT_LINE" "$CLAUDE_MD"; then
+if [ ! -e "$CLAUDE_MD" ]; then
+    printf '%s\n' "$IMPORT_LINE" > "$CLAUDE_MD"
+    say "✓ created $CLAUDE_MD with '$IMPORT_LINE'"
+elif [ ! -s "$CLAUDE_MD" ]; then
+    printf '%s\n' "$IMPORT_LINE" > "$CLAUDE_MD"
+    say "✓ wrote '$IMPORT_LINE' to empty $CLAUDE_MD"
+elif grep -Fxq "$IMPORT_LINE" "$CLAUDE_MD"; then
     say "✓ @import already present — no change"
 else
-    # Append with a leading blank line if file is non-empty and doesn't end with one.
-    if [ -s "$CLAUDE_MD" ]; then
-        # Ensure trailing newline before appending.
-        tail -c1 "$CLAUDE_MD" | od -An -c | grep -q '\\n' || printf '\n' >> "$CLAUDE_MD"
-        printf '\n%s\n' "$IMPORT_LINE" >> "$CLAUDE_MD"
-    else
-        printf '%s\n' "$IMPORT_LINE" >> "$CLAUDE_MD"
-    fi
+    # File has content — append with a leading blank line, ensuring trailing newline first.
+    tail -c1 "$CLAUDE_MD" | od -An -c | grep -q '\\n' || printf '\n' >> "$CLAUDE_MD"
+    printf '\n%s\n' "$IMPORT_LINE" >> "$CLAUDE_MD"
     say "✓ appended '$IMPORT_LINE' to $CLAUDE_MD"
 fi
 
