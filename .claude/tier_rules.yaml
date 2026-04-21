@@ -1,0 +1,64 @@
+version: 1
+# Canonical tier catalog for Claude Code complexity-tier routing (v1 PoC).
+#
+# V1: Claude reads the inlined copy in CLAUDE.md §"Complexity Tier Routing".
+#     This file is the source of truth; the CLAUDE.md table must be kept in
+#     sync manually until v2 tooling (monitor.py tier-suggest) generates it.
+#
+# Do NOT reference this file at runtime yet — Claude Code does not auto-load
+# it, and an explicit Read call inside a turn is unreliable. The inlined
+# copy in CLAUDE.md is what actually influences routing.
+
+tiers:
+  - id: tier-2-routine
+    worker: routine-worker          # subagent_type for the Agent tool
+    model: sonnet                   # set by the subagent frontmatter
+    signals:
+      verbs:
+        - rename
+        - typo
+        - format
+        - add-comment
+        - add-log
+        - add-null-check
+        - add-docstring
+        - add-boilerplate
+        - update-import
+        - update-readme
+        - fix-lint
+        - add-unit-test
+        - write-data-model
+        - update-docs
+        - simple-diagram
+      shape:
+        - single-file at known location
+        - follows existing pattern
+        - user gave exact file:line or exact rename
+      max_files_read: 4
+    examples:
+      - "fix typo in README line 42"
+      - "đổi Y thành Z trong service.swift"
+      - "add null-check at UserService.swift:88"
+      - "update the installation section of README"
+      - "draw a simple sequence diagram of the login flow"
+
+  - id: tier-3-main
+    worker: null                    # main handles, no delegation
+    model: main                     # whatever the user's default is (usually Opus)
+    signals:
+      verbs:
+        - design
+        - investigate
+        - why
+        - refactor-across
+        - review-for-bugs
+        - figure-out
+        - debug-unknown
+      shape:
+        - open-ended
+        - requires reading more than 4 files
+        - needs judgment about structure, audience, or correctness
+    examples:
+      - "why is the heatmap off by one hour"
+      - "design the tier-suggest v2 feedback loop"
+      - "review this PR for subtle bugs"

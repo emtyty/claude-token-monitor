@@ -1,0 +1,1 @@
+../../plugin/agents/routine-worker.md

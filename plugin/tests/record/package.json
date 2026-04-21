@@ -1,0 +1,15 @@
+{
+  "name": "claude-token-monitor-record",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "install:browsers": "playwright install chromium",
+    "record": "playwright test",
+    "record:desktop": "playwright test --project=desktop-16x9",
+    "record:mobile": "playwright test --project=mobile-9x16",
+    "convert": "bash convert.sh"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0"
+  }
+}

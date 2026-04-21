@@ -1,0 +1,13 @@
+node_modules/
+videos/
+test-results/
+playwright-report/
+*.cast.bak
+# regenerated per-machine by capture.sh
+summary.cast
+report.html
+
+# Scaffold files the root .gitignore matches (*.json / *.html) — force-include.
+!package.json
+!package-lock.json
+!demo.html

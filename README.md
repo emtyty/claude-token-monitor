@@ -1,5 +1,7 @@
 # MonitorTokenUsage
 
+![demo](plugin/tests/record/demo-16x9.gif)
+
 A single-file Python CLI that reads Claude Code's session JSONL logs from
 `~/.claude/projects/` and reports token usage, estimated costs, trends,
 and budget status.
@@ -9,14 +11,69 @@ already writes locally.
 
 ## Install
 
+### CLI only (just the monitor)
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Only dependency: `rich` (for tables, colours, live mode). The script
+### CLI + routing plugin (recommended)
+
+Installs the CLI, registers the `routine-worker` Sonnet subagent globally,
+and adds a complexity-tier routing directive to `~/.claude/CLAUDE.md` so
+every Claude Code session delegates routine edits to Sonnet:
+
+```bash
+# macOS / Linux
+bash plugin/hooks/install.sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -File plugin\hooks\install.ps1
+```
+
+The script is idempotent — re-run it after `git pull` to refresh.
+
+On macOS/Linux the agent is installed as a symlink into `~/.claude/agents/`,
+so repo updates propagate automatically. Windows copies the file; re-run the
+installer to pick up changes.
+
+To uninstall: remove the block between the
+`<!-- claude-token-monitor:tier-routing:* -->` markers in `~/.claude/CLAUDE.md`
+and delete `~/.claude/agents/routine-worker.md`.
+
+Only Python dependency: `rich` (for tables, colours, live mode). The script
 also runs without `rich` with a plain-text fallback.
 
 Requires Python 3.10+ (uses PEP 604 `X | Y` type hints and `str.removeprefix`-era stdlib).
+
+## Testing the routing plugin
+
+Three test layers, fastest → slowest:
+
+```bash
+# Unit tests (stdlib unittest, ~29 tests, <1s)
+python3 plugin/tests/test_check_routing.py -v
+
+# Installer regression tests (sandbox-based, ~19 asserts, ~1s)
+bash plugin/tests/test_install.sh
+
+# Full end-to-end (install + unit + synthetic-data pipeline, ~3s)
+bash plugin/tests/e2e.sh
+```
+
+`check_routing.py` also works as a live verification on your real sessions:
+
+```bash
+# Did main Claude actually delegate to routine-worker recently?
+python3 plugin/tests/check_routing.py --verbose
+
+# Scope to one project / widen window
+python3 plugin/tests/check_routing.py --project my-repo --hours 168
+```
+
+Exit codes: `0` = routing confirmed · `1` = no Tier-2 invocations in window ·
+`2` = invocations happened but subagent did not run on Sonnet (agent
+frontmatter misconfigured).
 
 ## Usage
 

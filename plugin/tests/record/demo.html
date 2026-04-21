@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>claude-token-monitor — demo</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/asciinema-player@3/dist/bundle/asciinema-player.css">
+  <script src="https://cdn.jsdelivr.net/npm/asciinema-player@3/dist/bundle/asciinema-player.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; width: 100%; overflow: hidden; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      display: flex;
+      gap: 16px;
+      padding: 24px;
+    }
+    section { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+    .label {
+      font-size: 12px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      opacity: 0.55;
+      margin-bottom: 10px;
+      font-weight: 600;
+      transition: color 0.4s;
+    }
+    .label.hot { color: #ff8c42; opacity: 1; }
+    .surface { flex: 1; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.4); position: relative; }
+    #player { width: 100%; height: 100%; }
+    iframe { width: 100%; height: 100%; border: 0; background: #fff; }
+
+    @media (orientation: portrait) {
+      body { flex-direction: column; padding: 16px; gap: 12px; }
+      section.terminal { flex: 0 0 55%; }
+      section.report   { flex: 0 0 45%; }
+    }
+  </style>
+</head>
+<body>
+  <section class="terminal">
+    <div class="label" id="term-label">→ python monitor.py</div>
+    <div class="surface"><div id="player"></div></div>
+  </section>
+  <section class="report">
+    <div class="label" id="report-label">HTML report — Overview</div>
+    <div class="surface"><iframe id="report" src="/plugin/tests/record/report.html"></iframe></div>
+  </section>
+
+  <script>
+    const player = AsciinemaPlayer.create(
+      '/plugin/tests/record/summary.cast',
+      document.getElementById('player'),
+      { autoPlay: true, speed: 1.0, theme: 'monokai', fit: 'both', controls: false,
+        poster: 'npt:0:0', cols: 140, rows: 32 }
+    );
+
+    const iframe = document.getElementById('report');
+    const reportLabel = document.getElementById('report-label');
+
+    function scrollReportTo(fraction, labelText, hot = false) {
+      const doc = iframe.contentDocument;
+      if (!doc) return;
+      const el = doc.scrollingElement || doc.documentElement;
+      const target = (el.scrollHeight - el.clientHeight) * fraction;
+      el.scrollTo({ top: target, behavior: 'smooth' });
+      if (labelText) {
+        reportLabel.textContent = labelText;
+        reportLabel.classList.toggle('hot', hot);
+      }
+    }
+
+    // Choreography — times in ms, synced with demo-flow.sh acts (cast ~21.6s).
+    //  0–6s    Act 1: summary          → Overview / By Model
+    //  6–16s   Act 2: suggest --top 5  → scroll down toward Efficiency Suggestions
+    // 16–22s   Act 3: tier-routing     → hold on Efficiency Suggestions
+    iframe.addEventListener('load', () => {
+      setTimeout(() => scrollReportTo(0.00, 'HTML report — Overview'),                             500);
+      setTimeout(() => scrollReportTo(0.18, 'HTML report — By Model / Daily'),                    5500);
+      setTimeout(() => scrollReportTo(0.42, 'HTML report — Usage Heatmap'),                      10000);
+      setTimeout(() => scrollReportTo(0.58, 'Efficiency Suggestions ← switch to Sonnet', true),  14000);
+      setTimeout(() => scrollReportTo(0.70, 'Efficiency Suggestions ← switch to Sonnet', true),  19000);
+    });
+
+    window.__demoDone = new Promise((resolve) => {
+      player.addEventListener('ended', () => resolve());
+    });
+  </script>
+</body>
+</html>
