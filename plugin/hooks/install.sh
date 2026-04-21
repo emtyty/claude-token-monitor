@@ -61,10 +61,12 @@ cp "$TIER_BLOCK" "$TIER_FILE_DST"
 say "✓ tier-routing block written to $TIER_FILE_DST"
 
 echo "Linking tier-routing into $CLAUDE_MD..."
-if [ ! -s "$CLAUDE_MD" ]; then
-    say "⚠ $CLAUDE_MD does not exist or is empty — skipping @import step"
-    say "  To activate global tier routing, create $CLAUDE_MD and add this line:"
-    say "      $IMPORT_LINE"
+if [ ! -e "$CLAUDE_MD" ]; then
+    printf '%s\n' "$IMPORT_LINE" > "$CLAUDE_MD"
+    say "✓ created $CLAUDE_MD with '$IMPORT_LINE'"
+elif [ ! -s "$CLAUDE_MD" ]; then
+    printf '%s\n' "$IMPORT_LINE" > "$CLAUDE_MD"
+    say "✓ wrote '$IMPORT_LINE' to empty $CLAUDE_MD"
 elif grep -Fxq "$IMPORT_LINE" "$CLAUDE_MD"; then
     say "✓ @import already present — no change"
 else

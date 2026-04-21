@@ -54,10 +54,12 @@ Copy-Item $TierBlock $TierFileDst -Force
 Write-Host "  v tier-routing block written to $TierFileDst"
 
 Write-Host "Linking tier-routing into $ClaudeMd..."
-if (-not (Test-Path $ClaudeMd) -or ((Get-Item $ClaudeMd -ErrorAction SilentlyContinue).Length -eq 0)) {
-    Write-Host "  ! $ClaudeMd does not exist or is empty - skipping @import step"
-    Write-Host "    To activate global tier routing, create $ClaudeMd and add this line:"
-    Write-Host "        $ImportLine"
+if (-not (Test-Path $ClaudeMd)) {
+    Set-Content -Path $ClaudeMd -Value $ImportLine
+    Write-Host "  v created $ClaudeMd with '$ImportLine'"
+} elseif ((Get-Item $ClaudeMd).Length -eq 0) {
+    Set-Content -Path $ClaudeMd -Value $ImportLine
+    Write-Host "  v wrote '$ImportLine' to empty $ClaudeMd"
 } else {
     $existingLines = Get-Content $ClaudeMd -ErrorAction SilentlyContinue
     if ($existingLines | Where-Object { $_ -eq $ImportLine }) {
