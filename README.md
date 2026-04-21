@@ -1,6 +1,6 @@
 # MonitorTokenUsage
 
-<video src="plugin/tests/record/demo-16x9.mp4" controls muted playsinline width="100%"></video>
+![demo](plugin/tests/record/demo-16x9.gif)
 
 A single-file Python CLI that reads Claude Code's session JSONL logs from
 `~/.claude/projects/` and reports token usage, estimated costs, trends,
