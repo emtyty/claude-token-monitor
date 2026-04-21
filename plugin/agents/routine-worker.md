@@ -1,6 +1,6 @@
 ---
 name: routine-worker
-description: Use PROACTIVELY for routine coding tasks at known locations that do not need deep reasoning. Runs on Sonnet to save ~80% cost vs Opus. Good for single-file edits, typos, renames, boilerplate, docstrings, import cleanup, obvious lint fixes, README updates, unit tests that follow an existing pattern, and short follow-up tweaks within a conversation. Not for architectural decisions, debugging unknown failures, multi-file refactors in unfamiliar code, design judgment, or open-ended questions. When in doubt, delegate.
+description: Use PROACTIVELY for routine coding tasks at known locations that do not need deep reasoning (single-file edits, renames, typos, boilerplate, docstrings, lint fixes, README updates, simple tests). Runs on Sonnet to save cost versus Opus. See body for the full trigger list. When in doubt, delegate.
 model: sonnet
 ---
 
