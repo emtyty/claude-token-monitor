@@ -261,6 +261,172 @@ def load_all() -> list[Record]:
     return list(iter_records(projects_root()))
 
 
+# ----------------------- Tier-2 routing analytics ----------------------- #
+
+
+def _subagent_first_prompt(subagent_file: Path) -> str:
+    """Return the first user-message content of a subagent session (the prompt
+    the delegator sent). Empty string on any error."""
+    try:
+        with subagent_file.open("r", encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+    except OSError:
+        return ""
+    try:
+        d = json.loads(first)
+    except json.JSONDecodeError:
+        return ""
+    msg = d.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(parts) if parts else ""
+    return ""
+
+
+def _sum_subagent_usage(subagent_file: Path) -> dict:
+    """Sum token usage across all assistant messages in a subagent transcript.
+    Returns dict with in/out/cr/cw token totals, actual cost (using the
+    subagent's recorded model pricing) and hypothetical cost if the same
+    tokens had run on Opus."""
+    agg = {"in": 0, "out": 0, "cr": 0, "cw": 0}
+    model = ""
+    try:
+        f = subagent_file.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return {**agg, "cost_actual": 0.0, "cost_opus": 0.0, "model": model}
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line or line[0] != "{":
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            usage = msg.get("usage")
+            if not usage:
+                continue
+            if not model:
+                model = msg.get("model") or ""
+            agg["in"]  += int(usage.get("input_tokens") or 0)
+            agg["out"] += int(usage.get("output_tokens") or 0)
+            agg["cr"]  += int(usage.get("cache_read_input_tokens") or 0)
+            agg["cw"]  += int(usage.get("cache_creation_input_tokens") or 0)
+    def _cost_with(price: dict) -> float:
+        return (
+            agg["in"]  * price["in"]  / 1_000_000
+            + agg["out"] * price["out"] / 1_000_000
+            + agg["cr"]  * price["cr"]  / 1_000_000
+            + agg["cw"]  * price["cw"]  / 1_000_000
+        )
+    cost_actual = _cost_with(model_price(model))
+    cost_opus = _cost_with(PRICING["claude-opus-4"])
+    return {**agg, "cost_actual": cost_actual, "cost_opus": cost_opus, "model": model}
+
+
+def collect_routing_stats(root: Path, project_filter: str | None = None) -> list[dict]:
+    """Scan parent sessions for Agent→routine-worker invocations and link each
+    to its subagent transcript (matched by prompt fingerprint) to compute
+    per-delegation savings (Opus hypothetical cost − Sonnet actual cost).
+
+    Returns a list of delegation dicts, one per invocation, with keys:
+      project, session_id, timestamp, description, prompt,
+      in/out/cr/cw, cost_actual, cost_opus, saved, model, matched.
+    """
+    delegations: list[dict] = []
+    if not root.exists():
+        return delegations
+
+    for project_dir in sorted(root.iterdir()):
+        if not project_dir.is_dir():
+            continue
+        if project_filter:
+            q = project_filter.lower()
+            if (q not in decode_project(project_dir.name).lower()
+                    and q not in project_dir.name.lower()):
+                continue
+        for parent_file in project_dir.glob("*.jsonl"):
+            session_id = parent_file.stem
+            subagent_dir = project_dir / session_id / "subagents"
+
+            parent_calls: list[dict] = []
+            try:
+                pf = parent_file.open("r", encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with pf:
+                for line in pf:
+                    line = line.strip()
+                    if not line or line[0] != "{":
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if e.get("type") != "assistant":
+                        continue
+                    msg = e.get("message") or {}
+                    for b in (msg.get("content") or []):
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") != "tool_use" or b.get("name") != "Agent":
+                            continue
+                        inp = b.get("input") or {}
+                        if inp.get("subagent_type") != "routine-worker":
+                            continue
+                        parent_calls.append({
+                            "description": (inp.get("description") or "").strip(),
+                            "prompt": (inp.get("prompt") or "").strip(),
+                            "timestamp": e.get("timestamp") or "",
+                        })
+
+            if not parent_calls:
+                continue
+
+            # Fingerprint each subagent file by the first 500 chars of its
+            # first user message (= the prompt the delegator sent).
+            subagent_by_fp: dict[str, Path] = {}
+            if subagent_dir.exists():
+                for sf in subagent_dir.glob("agent-*.jsonl"):
+                    fp = _subagent_first_prompt(sf)[:500].strip()
+                    if fp:
+                        subagent_by_fp.setdefault(fp, sf)
+
+            for pc in parent_calls:
+                fp = pc["prompt"][:500].strip()
+                sf = subagent_by_fp.get(fp)
+                base = {
+                    "project": project_dir.name,
+                    "session_id": session_id,
+                    "timestamp": pc["timestamp"],
+                    "description": pc["description"],
+                    "prompt": pc["prompt"],
+                    "in": 0, "out": 0, "cr": 0, "cw": 0,
+                    "cost_actual": 0.0, "cost_opus": 0.0,
+                    "saved": 0.0, "model": "", "matched": False,
+                }
+                if sf is not None:
+                    u = _sum_subagent_usage(sf)
+                    base.update({
+                        "in": u["in"], "out": u["out"],
+                        "cr": u["cr"], "cw": u["cw"],
+                        "cost_actual": u["cost_actual"],
+                        "cost_opus": u["cost_opus"],
+                        "saved": u["cost_opus"] - u["cost_actual"],
+                        "model": u["model"],
+                        "matched": bool(u["in"] or u["out"] or u["cr"] or u["cw"]),
+                    })
+                delegations.append(base)
+    return delegations
+
+
 # ------------------------------- Commands ------------------------------- #
 
 
@@ -1102,7 +1268,70 @@ def cmd_report(args) -> None:
             row_total = sum(grid[dow])
             console.print(f"  [bold]{dow_labels[dow]}[/bold]  {cells}  {fmt_cost(row_total):>8s}")
 
-        # Section 5: suggestions
+        # Section 6: tier-2 routing (routine-worker delegations)
+        project_filter = getattr(args, "project", None)
+        routing = collect_routing_stats(projects_root(), project_filter)
+        if routing:
+            matched = [d for d in routing if d["matched"]]
+            total_tokens = sum(d["in"] + d["out"] + d["cr"] + d["cw"] for d in matched)
+            total_actual = sum(d["cost_actual"] for d in matched)
+            total_opus = sum(d["cost_opus"] for d in matched)
+            total_saved = sum(d["saved"] for d in matched)
+
+            console.print()
+            console.rule("[bold]Tier-2 Routing — routine-worker delegations[/bold]")
+
+            summary = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+            summary.add_column("Metric", style="bold")
+            summary.add_column("Value", justify="right")
+            summary.add_row("Delegations (total)", f"[cyan]{len(routing)}[/cyan]")
+            if len(matched) != len(routing):
+                summary.add_row("  of which linked to a subagent transcript",
+                                f"{len(matched)}")
+            summary.add_row("Subagent tokens (all tiers)", fmt_num(total_tokens))
+            summary.add_row("Actual subagent cost", fmt_cost(total_actual))
+            summary.add_row("Hypothetical cost on Opus", fmt_cost(total_opus))
+            summary.add_row("[bold green]Saved[/bold green]",
+                            f"[bold green]{fmt_cost(total_saved)}[/bold green]")
+            console.print(summary)
+
+            recent = sorted(routing, key=lambda d: d["timestamp"], reverse=True)[:10]
+            detail = Table(
+                box=box.SIMPLE_HEAVY, show_header=True, header_style="bold",
+                title="Recent delegations (top 10, most recent first)"
+            )
+            detail.add_column("Time", style="dim", no_wrap=True)
+            detail.add_column("Project", style="cyan", max_width=22, overflow="fold")
+            detail.add_column("Reason", overflow="fold")
+            detail.add_column("Tokens", justify="right")
+            detail.add_column("Saved", justify="right")
+            for d in recent:
+                ts = parse_ts(d["timestamp"])
+                time_str = ts.astimezone().strftime("%m-%d %H:%M") if ts else "?"
+                proj = decode_project(d["project"])
+                proj_short = proj.rsplit("/", 1)[-1] if "/" in proj else proj
+                tokens = d["in"] + d["out"] + d["cr"] + d["cw"]
+                if d["matched"]:
+                    detail.add_row(
+                        time_str, proj_short,
+                        d["description"] or "(no description)",
+                        fmt_num(tokens),
+                        f"[green]{fmt_cost(d['saved'])}[/green]",
+                    )
+                else:
+                    detail.add_row(
+                        time_str, proj_short,
+                        d["description"] or "(no description)",
+                        "[dim]—[/dim]", "[dim]—[/dim]",
+                    )
+            console.print(detail)
+            console.print(
+                "[dim]Savings = (tokens × Opus price) − (tokens × actual subagent price). "
+                "Only counts delegations whose subagent transcript could be linked "
+                "by prompt fingerprint; unmatched rows show '—'.[/dim]"
+            )
+
+        # Section 7: suggestions
         console.print()
         console.rule("[bold]Efficiency Suggestions[/bold]")
         suggestions = analyze_suggestions(records)
