@@ -248,10 +248,12 @@ class ParseDurationTest(unittest.TestCase):
 
 
 class LargeContextRuleTest(unittest.TestCase):
-    """The new alert: large-context sessions should be flagged with severity
-    'high' when any single call >=180K, 'med' when >=150K but <180K."""
+    """large-context: thresholds are proportional to the model's context cap.
+    200K-cap models warn at 150K / alert at 180K; 1M-cap models (Opus 4.6/4.7)
+    warn at 750K / alert at 900K."""
 
-    def _make(self, ctx_tokens: int) -> list[monitor.Record]:
+    def _make(self, ctx_tokens: int,
+              model: str = "claude-sonnet-4-6") -> list[monitor.Record]:
         # Put the whole context in cache_read so it counts toward the
         # input-side total used by the rule.
         usage = {"input_tokens": 0, "output_tokens": 200,
@@ -259,9 +261,9 @@ class LargeContextRuleTest(unittest.TestCase):
                  "cache_creation_input_tokens": 0}
         rec = monitor.Record(
             project="p", session_id="bigctx", timestamp="2026-04-15T10:00:00+00:00",
-            model="claude-sonnet-4-6",
+            model=model,
             usage=usage,
-            cost=monitor.calc_cost(usage, "claude-sonnet-4-6"),
+            cost=monitor.calc_cost(usage, model),
             cwd="", msg_id="m1",
         )
         return [rec]
@@ -282,6 +284,32 @@ class LargeContextRuleTest(unittest.TestCase):
         suggestions = monitor.analyze_suggestions(self._make(100_000))
         big = [s for s in suggestions if s.rule == "large-context"]
         self.assertEqual(big, [])
+
+    def test_opus_4_7_no_alert_at_500k(self):
+        # 500K on a 1M-cap model = 50% — well below the 75% warn floor.
+        # The old 200K-assumption rule would have falsely flagged this as 'high'.
+        suggestions = monitor.analyze_suggestions(
+            self._make(500_000, model="claude-opus-4-7"))
+        big = [s for s in suggestions if s.rule == "large-context"]
+        self.assertEqual(big, [],
+                         "1M-cap model at 50% must not fire (the bug we fixed)")
+
+    def test_opus_4_7_med_at_750k(self):
+        # 75% of 1M = warn threshold, no alert → med severity.
+        suggestions = monitor.analyze_suggestions(
+            self._make(760_000, model="claude-opus-4-7"))
+        big = [s for s in suggestions if s.rule == "large-context"]
+        self.assertEqual(len(big), 1)
+        self.assertEqual(big[0].severity, "med")
+        self.assertIn("1.00M cap", big[0].evidence)
+
+    def test_opus_4_7_high_at_900k(self):
+        # 90%+ of 1M = alert tier → high severity.
+        suggestions = monitor.analyze_suggestions(
+            self._make(950_000, model="claude-opus-4-7"))
+        big = [s for s in suggestions if s.rule == "large-context"]
+        self.assertEqual(len(big), 1)
+        self.assertEqual(big[0].severity, "high")
 
 
 class ExpensiveSingleCallRuleTest(unittest.TestCase):
@@ -388,6 +416,151 @@ class CacheColdSessionRuleTest(unittest.TestCase):
             self._rec("cheap", f"m{i}", input_tok=1_000, cache_read=100)
             for i in range(5)
         ]
+        self.assertEqual(self._findings(recs), [])
+
+
+class PlanModeOpusRuleTest(unittest.TestCase):
+    """plan-mode-opus: fires on Opus sessions whose plan window (records up to
+    the last ExitPlanMode call) was scan-dominated AND a meaningful slice of
+    the session's cost. Synthesis-dominated plan windows must be skipped —
+    Opus is the right tool for plan synthesis."""
+
+    @staticmethod
+    def _rec(session_id: str, msg_id: str, ts: str,
+             tools: list[str], read_paths: list[str], cost: float,
+             input_tok: int = 50_000, cache_read: int = 0,
+             model: str = "claude-opus-4-7") -> monitor.Record:
+        usage = {
+            "input_tokens": input_tok, "output_tokens": 200,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": 0,
+        }
+        return monitor.Record(
+            project="p", session_id=session_id, timestamp=ts,
+            model=model, usage=usage, cost=cost,
+            cwd="", msg_id=msg_id,
+            tools=list(tools), read_paths=list(read_paths),
+        )
+
+    def _findings(self, recs):
+        return [s for s in monitor.analyze_suggestions(recs)
+                if s.rule == "plan-mode-opus"]
+
+    @staticmethod
+    def _ts(i: int) -> str:
+        # Strictly increasing tz-aware ISO timestamps.
+        return f"2026-04-15T10:{i:02d}:00+00:00"
+
+    def test_fires_on_scan_dominated_plan(self):
+        # 6 records, all Read on .py files, last carries ExitPlanMode.
+        # plan_cost = $6, total = $6 → share 100%, well above 40% gate.
+        recs = [
+            self._rec("plan1", f"m{i}", self._ts(i),
+                      tools=["Read"], read_paths=[f"/proj/f{i}.py"], cost=1.0)
+            for i in range(5)
+        ]
+        recs.append(self._rec("plan1", "m5", self._ts(5),
+                              tools=["Read", "ExitPlanMode"],
+                              read_paths=["/proj/f5.py"], cost=1.0))
+        f = self._findings(recs)
+        self.assertEqual(len(f), 1)
+        self.assertIn("ast-graph", f[0].action,
+                      "Python project → action should lead with ast-graph")
+
+    def test_skips_synthesis_dominated_plan(self):
+        # Plan window has tools but none are explore (TodoWrite is neither
+        # _EXPLORE nor _MUTATE) → explore_ratio = 0 → skip.
+        recs = [
+            self._rec("plan2", f"m{i}", self._ts(i),
+                      tools=["TodoWrite"], read_paths=[], cost=1.0)
+            for i in range(5)
+        ]
+        recs.append(self._rec("plan2", "m5", self._ts(5),
+                              tools=["TodoWrite", "ExitPlanMode"],
+                              read_paths=[], cost=1.0))
+        self.assertEqual(self._findings(recs), [],
+                         "synthesis-dominated plan must NOT fire")
+
+    def test_skips_when_plan_window_too_short(self):
+        # Only 3 records before ExitPlanMode → below the 5-record floor.
+        recs = [
+            self._rec("plan3", f"m{i}", self._ts(i),
+                      tools=["Read"], read_paths=[f"/p/f{i}.py"], cost=1.0)
+            for i in range(2)
+        ]
+        recs.append(self._rec("plan3", "m2", self._ts(2),
+                              tools=["Read", "ExitPlanMode"],
+                              read_paths=["/p/f2.py"], cost=1.0))
+        self.assertEqual(self._findings(recs), [])
+
+    def test_skips_when_plan_cost_share_too_low(self):
+        # Plan window: 5 cheap explore calls ($0.20 each = $1) + ExitPlanMode.
+        # Implementation: 10 expensive Edit calls ($5 each = $50).
+        # Plan share = 1/51 ≈ 2% — well below the 40% gate.
+        plan = [
+            self._rec("plan4", f"p{i}", self._ts(i),
+                      tools=["Read"], read_paths=[f"/p/f{i}.py"], cost=0.20)
+            for i in range(5)
+        ]
+        plan.append(self._rec("plan4", "p5", self._ts(5),
+                              tools=["Read", "ExitPlanMode"],
+                              read_paths=["/p/f5.py"], cost=0.20))
+        impl = [
+            self._rec("plan4", f"i{i}", self._ts(10 + i),
+                      tools=["Edit"], read_paths=[], cost=5.0)
+            for i in range(10)
+        ]
+        self.assertEqual(self._findings(plan + impl), [])
+
+    def test_uses_last_exit_plan_mode_as_boundary(self):
+        # Two ExitPlanMode calls; plan window must extend to the LAST one.
+        # Records 0-4: scan-heavy explore. Record 2 has an ExitPlanMode.
+        # Records 5-7: scan-heavy explore. Record 7 has the final ExitPlanMode.
+        # All 8 should be in the plan window → 8 calls × $1 = $8 plan_cost,
+        # 100% share → fires.
+        recs = []
+        for i in range(8):
+            tools = ["Read"]
+            if i in (2, 7):
+                tools.append("ExitPlanMode")
+            recs.append(self._rec("plan5", f"m{i}", self._ts(i),
+                                   tools=tools,
+                                   read_paths=[f"/p/f{i}.py"], cost=1.0))
+        f = self._findings(recs)
+        self.assertEqual(len(f), 1)
+        self.assertIn("8 call(s)", f[0].evidence,
+                      "evidence should report plan window size = 8 (last ExitPlanMode)")
+        self.assertIn("2 plan turn(s)", f[0].evidence)
+
+    def test_high_severity_with_read_spray(self):
+        # 12 records with distinct file paths → distinct_reads = 12 ≥ 10
+        # plan_cost = 12 × $2 = $24 ≥ $20 → severity bumps to 'high'.
+        recs = [
+            self._rec("plan6", f"m{i}", self._ts(i),
+                      tools=["Read"], read_paths=[f"/p/distinct_{i}.py"], cost=2.0,
+                      input_tok=200_000)
+            for i in range(11)
+        ]
+        recs.append(self._rec("plan6", "m11", self._ts(11),
+                              tools=["Read", "ExitPlanMode"],
+                              read_paths=["/p/distinct_11.py"], cost=2.0,
+                              input_tok=200_000))
+        f = self._findings(recs)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0].severity, "high")
+
+    def test_skips_when_plan_window_not_opus_dominated(self):
+        # Plan window mostly Sonnet → rule 9 (explore-on-opus) territory, not us.
+        recs = [
+            self._rec("plan7", f"m{i}", self._ts(i),
+                      tools=["Read"], read_paths=[f"/p/f{i}.py"], cost=1.0,
+                      model="claude-sonnet-4-6")
+            for i in range(5)
+        ]
+        recs.append(self._rec("plan7", "m5", self._ts(5),
+                              tools=["Read", "ExitPlanMode"],
+                              read_paths=["/p/f5.py"], cost=1.0,
+                              model="claude-sonnet-4-6"))
         self.assertEqual(self._findings(recs), [])
 
 

@@ -52,14 +52,18 @@ The full dashboard and `suggest` subcommand flag cost patterns:
 | Rule | What it catches |
 |---|---|
 | `opus-heavy-project` | Projects where Opus handles routine edits — switch to Sonnet |
-| `opus-routine-session` | Short-output Opus sessions not using reasoning |
-| `day-spike` | Days costing 3× median — likely runaway context |
-| `low-cache-hit` | Poor cache reuse per project or session |
-| `raw-input-spike` | Massive raw input turns (noisy tool output in context) |
-| `session-fragmentation` | Many short sessions causing cache rebuild overhead |
-| `cache-rebuild` | High cache-write vs cache-read ratio |
-| `many-reads` | Read/Grep-heavy sessions — ast-graph could replace |
-| `explore-on-opus` | Exploration/plan sessions on Opus unnecessarily |
+| `opus-routine-session` | Long all-Opus sessions with small outputs — likely routine |
+| `low-cache-hit` | Spendy projects with cache hit rate <40% |
+| `raw-input-spike` | ≥3 calls/project with raw input ≥50K tokens (log/diff dumps) |
+| `day-spike` | Days costing ≥3× the 30-day median |
+| `session-fragmentation` | ≥3 short sessions per (project, day) — cache rebuilt repeatedly |
+| `cache-rebuild` | Sessions with cache-write/read ratio ≥0.2 (healthy <0.1) |
+| `many-reads` | ≥30 Reads/session on ast-graph-supported langs |
+| `explore-on-opus` | Opus sessions where ≥85% of tools are Read/Grep/Glob etc. |
+| `plan-mode-opus` | Plan-mode sessions where the plan window was scan-dominated (Opus stays for synthesis; ast-graph replaces the spelunking) |
+| `large-context` | Sessions whose peak call approaches the model's context cap (warn 75%, alert 90%) |
+| `expensive-single-call` | Any individual API call >$5 (≥$10 → high severity) |
+| `cache-cold-session` | Per-session cache hit rate <30% with ≥5 calls and ≥$2 cost |
 
 Savings estimates are directional (Opus→Sonnet ≈ 80% cheaper).
 

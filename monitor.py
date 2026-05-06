@@ -73,6 +73,26 @@ def calc_cost(usage: dict, model: str) -> float:
     )
 
 
+# Context window cap per model family (in tokens). Used by the live monitor
+# and rule 11 (large-context) to scale "approaching the cap" thresholds —
+# a 750K call on Opus 4.7 (1M cap) is at 75%, the same risk profile as a
+# 150K call on a 200K-cap model. Sonnet 4.x 1M-tier is plan-conditional and
+# not detectable from the model ID alone, so we keep it at the default.
+CONTEXT_CAP: dict[str, int] = {
+    "claude-opus-4-6": 1_000_000,
+    "claude-opus-4-7": 1_000_000,
+}
+DEFAULT_CONTEXT_CAP = 200_000
+
+
+def context_cap(model: str) -> int:
+    m = (model or "").lower()
+    for prefix, cap in CONTEXT_CAP.items():
+        if prefix in m:
+            return cap
+    return DEFAULT_CONTEXT_CAP
+
+
 def projects_root() -> Path:
     home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())
     return home / ".claude" / "projects"
@@ -735,8 +755,9 @@ def cmd_live(args) -> None:
     from rich.panel import Panel
     console = Console()
 
-    warn_tok  = max(1, getattr(args, "context_warn",  _CTX_WARN_TOK))
-    alert_tok = max(warn_tok + 1, getattr(args, "context_alert", _CTX_ALERT_TOK))
+    # CLI overrides (None = derive thresholds from the active session's model cap).
+    warn_override  = getattr(args, "context_warn",  None)
+    alert_override = getattr(args, "context_alert", None)
     budget_daily = getattr(args, "budget_daily", None)
 
     def _ctx_tokens(r: Record) -> int:
@@ -842,10 +863,13 @@ def cmd_live(args) -> None:
             if len(cur_proj) > 60:
                 cur_proj = "…" + cur_proj[-57:]
 
+            cap = context_cap(latest.model)
+            warn_tok  = warn_override  if warn_override  else int(cap * _CTX_WARN_RATIO)
+            alert_tok = alert_override if alert_override else int(cap * _CTX_ALERT_RATIO)
             if peak_ctx >= alert_tok:
                 ctx_color, border = "red", "red"
                 ctx_warn = (
-                    f"  [bold red on white] ⚠ NEAR/OVER 200K CAP — /clear NOW [/bold red on white]"
+                    f"  [bold red on white] ⚠ NEAR/OVER {fmt_num(cap)} CAP — /clear NOW [/bold red on white]"
                 )
             elif peak_ctx >= warn_tok:
                 ctx_color, border = "yellow", "yellow"
@@ -2117,11 +2141,18 @@ def _rule_explore_on_opus(records: list[Record]) -> list[Suggestion]:
 
 
 def _rule_plan_mode_opus(records: list[Record]) -> list[Suggestion]:
-    """Rule 10: plan-mode session on Opus.
+    """Rule 10: plan-mode session on Opus that spent its plan window scanning,
+    not synthesizing.
 
-    Detected via presence of the `ExitPlanMode` tool call in the session.
-    Plan/analysis drafts don't need Opus — ast-graph can replace much of
-    the structural exploration the planner has to do by hand.
+    Plan mode on Opus has two cost components: synthesis (Opus's strength,
+    cheap because output is small) and scan/investigate (Read/Grep/Glob
+    spelunking — mechanical, expensive, no upside from Opus reasoning).
+    The waste lives in the second one.
+
+    Detection: split the session at the last `ExitPlanMode` call to get the
+    plan window. Fire when the plan window was explore-dominated AND
+    represents a meaningful slice of the session's cost. A synthesis-heavy
+    plan window is skipped — Opus earned its keep.
     """
     by_session: dict[str, list[Record]] = defaultdict(list)
     for r in records:
@@ -2129,41 +2160,94 @@ def _rule_plan_mode_opus(records: list[Record]) -> list[Suggestion]:
             by_session[r.session_id].append(r)
     out: list[Suggestion] = []
     for sess, recs in by_session.items():
-        tools = [t for r in recs for t in r.tools]
-        plan_turns = sum(1 for t in tools if t == "ExitPlanMode")
-        if plan_turns == 0:
+        # Sort by timestamp; drop records whose timestamps don't parse.
+        dated = [(parse_ts(r.timestamp), r) for r in recs]
+        dated = [(ts, r) for ts, r in dated if ts is not None]
+        if not dated:
             continue
-        opus_recs = [r for r in recs if _is_opus(r.model)]
-        if not opus_recs or len(opus_recs) / len(recs) < 0.7:
+        dated.sort(key=lambda x: x[0])
+        sorted_recs = [r for _, r in dated]
+
+        # Plan window = everything up to and including the LAST ExitPlanMode call.
+        last_plan_idx = None
+        for i, r in enumerate(sorted_recs):
+            if "ExitPlanMode" in r.tools:
+                last_plan_idx = i
+        if last_plan_idx is None:
             continue
-        cost = sum(r.cost for r in recs)
-        if cost < 3:
+        plan_recs = sorted_recs[: last_plan_idx + 1]
+        if len(plan_recs) < 5:
             continue
-        opus_cost = sum(r.cost for r in opus_recs)
-        # Assume ~half the session's Opus spend is planning/analysis that
-        # could run on Sonnet — conservative 40% estimate.
-        savings = opus_cost * 0.4
-        projects = {decode_project(r.project) for r in recs}
-        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
-        lang_ok = _project_lang_supported(recs)
-        action = (
-            "Plan mode on Opus — draft the plan on Sonnet/Haiku, switch to Opus "
-            "only for the implementation turns."
-        )
+
+        # Plan window must be Opus-dominated (otherwise rule 9 covers it).
+        opus_recs = [r for r in plan_recs if _is_opus(r.model)]
+        if not opus_recs or len(opus_recs) / len(plan_recs) < 0.7:
+            continue
+
+        # Tool composition inside the plan window.
+        plan_tools = [t for r in plan_recs for t in r.tools]
+        if not plan_tools:
+            continue
+        explore = sum(1 for t in plan_tools if t in _EXPLORE_TOOLS)
+        explore_ratio = explore / len(plan_tools)
+        if explore_ratio < 0.70:
+            continue  # synthesis-dominated → Opus is the right tool, no finding
+
+        # Cost gating: plan window must be a meaningful slice of the session.
+        plan_cost  = sum(r.cost for r in plan_recs)
+        total_cost = sum(r.cost for r in sorted_recs)
+        if total_cost <= 0 or plan_cost / total_cost < 0.40 or plan_cost < 3:
+            continue
+
+        distinct_reads = len({p for r in plan_recs for p in r.read_paths})
+        plan_opus_cost = sum(r.cost for r in opus_recs)
+        lang_ok = _project_lang_supported(plan_recs)
+
         if lang_ok:
-            action += (
-                " Feed ast-graph `symbol` / `hotspots` / `blast-radius` / "
-                "`dead-code` output into the plan instead of letting Claude "
-                "Read/Grep the codebase to discover structure."
+            # Avoidable cost ≈ exploration-share of input-side spend in the plan
+            # window, discounted because ast-graph replaces some but not all reads.
+            input_side_cost = sum(
+                (int(r.usage.get("input_tokens") or 0)
+                 + int(r.usage.get("cache_read_input_tokens") or 0))
+                * model_price(r.model)["cr"] / 1_000_000
+                for r in plan_recs
             )
-        severity = "high" if savings >= 20 else "med" if savings >= 5 else "low"
+            savings = input_side_cost * explore_ratio * 0.5
+            action = (
+                "Opus is the right model for plan synthesis — keep it. "
+                "What's expensive here is the scan/investigate phase: feed "
+                "ast-graph (`symbol`, `hotspots`, `blast-radius`, `dead-code`) "
+                "output into the plan input so Opus doesn't burn tokens "
+                "Read/Grepping the codebase to discover structure."
+            )
+        else:
+            # No structural-tool fix available; model downgrade is the only lever.
+            savings = plan_opus_cost * 0.4
+            action = (
+                "Project isn't ast-graph-supported — draft the plan on Sonnet/"
+                "Haiku and switch to Opus for the implementation turns."
+            )
+
+        if distinct_reads >= 10 and plan_cost >= 20:
+            severity = "high"
+        elif savings >= 5:
+            severity = "med"
+        else:
+            severity = "low"
+
+        projects = {decode_project(r.project) for r in plan_recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        plan_turns = sum(1 for t in plan_tools if t == "ExitPlanMode")
         out.append(Suggestion(
             rule="plan-mode-opus",
             severity=severity,
             scope=f"session {sess[:8]} ({proj})",
             evidence=(
-                f"{len(recs)} calls · {plan_turns} plan-mode turn(s) · "
-                f"{len(opus_recs)} Opus · {fmt_cost(cost)}"
+                f"plan window {len(plan_recs)} call(s) · "
+                f"{int(explore_ratio*100)}% explore tools · "
+                f"{distinct_reads} distinct file(s) Read · "
+                f"{plan_turns} plan turn(s) · {fmt_cost(plan_cost)} "
+                f"({plan_cost/total_cost*100:.0f}% of session)"
             ),
             action=action,
             est_savings=savings,
@@ -2171,19 +2255,18 @@ def _rule_plan_mode_opus(records: list[Record]) -> list[Suggestion]:
     return out
 
 
-_CTX_WARN_TOK  = 150_000   # 75% of standard 200K context cap
-_CTX_ALERT_TOK = 180_000   # 90% — at this point context truncation is imminent
+_CTX_WARN_RATIO  = 0.75   # warn when a call hits 75% of the model's context cap
+_CTX_ALERT_RATIO = 0.90   # alert at 90% — truncation/summarization imminent
 
 
 def _rule_large_context(records: list[Record]) -> list[Suggestion]:
     """Rule 11: session whose single-call context (input + cache_r + cache_w)
     approaches or breaches the model's context cap.
 
-    Standard Sonnet/Opus cap is 200K tokens; some 1M-context variants exist.
-    Calls ≥150K are at risk of summarization/truncation; ≥180K means you're
-    paying for tokens that may never reach the model. We surface the worst
-    offending sessions per (project, session) and recommend `/clear` or a
-    smaller working set.
+    Thresholds are proportional to each call's model cap (see CONTEXT_CAP):
+    a 750K call on Opus 4.7 (1M cap) is at 75% — the same risk profile as a
+    150K call on a 200K-cap model. Calls past 90% are paying for tokens that
+    get summarized away or dropped before they reach the model.
     """
     by_session: dict[str, list[Record]] = defaultdict(list)
     for r in records:
@@ -2191,34 +2274,32 @@ def _rule_large_context(records: list[Record]) -> list[Suggestion]:
             by_session[r.session_id].append(r)
     out: list[Suggestion] = []
     for sess, recs in by_session.items():
-        contexts = [
-            int(r.usage.get("input_tokens") or 0)
-            + int(r.usage.get("cache_read_input_tokens") or 0)
-            + int(r.usage.get("cache_creation_input_tokens") or 0)
-            for r in recs
-        ]
-        if not contexts:
+        # Pair each record with its raw context size and cap-relative ratio.
+        ctx_recs = []
+        for r in recs:
+            c = (int(r.usage.get("input_tokens") or 0)
+                 + int(r.usage.get("cache_read_input_tokens") or 0)
+                 + int(r.usage.get("cache_creation_input_tokens") or 0))
+            cap = context_cap(r.model)
+            ratio = c / cap if cap else 0.0
+            ctx_recs.append((r, c, ratio))
+        if not ctx_recs:
             continue
-        peak = max(contexts)
-        if peak < _CTX_WARN_TOK:
+        peak_ratio = max(ratio for _, _, ratio in ctx_recs)
+        if peak_ratio < _CTX_WARN_RATIO:
             continue
-        n_warn  = sum(1 for c in contexts if c >= _CTX_WARN_TOK)
-        n_alert = sum(1 for c in contexts if c >= _CTX_ALERT_TOK)
+        n_warn  = sum(1 for _, _, ratio in ctx_recs if ratio >= _CTX_WARN_RATIO)
+        n_alert = sum(1 for _, _, ratio in ctx_recs if ratio >= _CTX_ALERT_RATIO)
+        peak_rec, peak_ctx, _ = max(ctx_recs, key=lambda x: x[2])
+        peak_cap = context_cap(peak_rec.model)
         cost = sum(r.cost for r in recs)
         projects = {decode_project(r.project) for r in recs}
         proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
-        # Savings estimate: assume `/clear` mid-session would have shed ~30%
-        # of input-side cost on the bloated tail. Conservative.
+        # Savings: input-side cost on warn-tier calls × 0.3 (assume `/clear`
+        # mid-session would have shed ~30% of bloated input). Conservative.
         input_side_cost = sum(
-            (int(r.usage.get("input_tokens") or 0)
-             + int(r.usage.get("cache_read_input_tokens") or 0)
-             + int(r.usage.get("cache_creation_input_tokens") or 0))
-            * model_price(r.model)["cr"] / 1_000_000
-            for r in recs if (
-                int(r.usage.get("input_tokens") or 0)
-                + int(r.usage.get("cache_read_input_tokens") or 0)
-                + int(r.usage.get("cache_creation_input_tokens") or 0)
-            ) >= _CTX_WARN_TOK
+            ctx * model_price(r.model)["cr"] / 1_000_000
+            for r, ctx, ratio in ctx_recs if ratio >= _CTX_WARN_RATIO
         )
         savings = input_side_cost * 0.3
         severity = "high" if n_alert else "med"
@@ -2227,15 +2308,17 @@ def _rule_large_context(records: list[Record]) -> list[Suggestion]:
             severity=severity,
             scope=f"session {sess[:8]} ({proj})",
             evidence=(
-                f"peak {fmt_num(peak)} tok · "
-                f"{n_warn} call(s) ≥{fmt_num(_CTX_WARN_TOK)}"
-                + (f", {n_alert} ≥{fmt_num(_CTX_ALERT_TOK)}" if n_alert else "")
+                f"peak {fmt_num(peak_ctx)} tok ({peak_ctx/peak_cap*100:.0f}% of "
+                f"{fmt_num(peak_cap)} cap) · "
+                f"{n_warn} call(s) ≥{int(_CTX_WARN_RATIO*100)}%"
+                + (f", {n_alert} ≥{int(_CTX_ALERT_RATIO*100)}%" if n_alert else "")
                 + f" · {len(recs)} calls · {fmt_cost(cost)}"
             ),
             action=(
-                "Session is approaching the 200K context cap — use `/clear` to "
-                "reset, or split unrelated work across sessions. Tokens past the "
-                "cap get summarized away (or dropped) but you still pay for them."
+                f"Session is approaching the model's context cap "
+                f"({fmt_num(peak_cap)} tok) — use `/clear` to reset, or split "
+                "unrelated work across sessions. Tokens past the cap get "
+                "summarized away (or dropped) but you still pay for them."
             ),
             est_savings=savings,
         ))
@@ -2399,14 +2482,14 @@ def _render_alert_banners(console, suggestions: list[Suggestion]) -> None:
         if high:
             console.print(
                 f"\n[bold red on white] ⚠ LARGE CONTEXT ALERT [/bold red on white] "
-                f"[bold red]{len(high)} session(s) ≥{fmt_num(_CTX_ALERT_TOK)} tok "
-                f"— context truncation likely.[/bold red] "
+                f"[bold red]{len(high)} session(s) ≥{int(_CTX_ALERT_RATIO*100)}% "
+                f"of context cap — truncation likely.[/bold red] "
                 f"Run [cyan]monitor suggest[/cyan] for details."
             )
         else:
             console.print(
                 f"\n[bold yellow]⚠ Large-context warning:[/bold yellow] "
-                f"{len(big)} session(s) ≥{fmt_num(_CTX_WARN_TOK)} tok. "
+                f"{len(big)} session(s) ≥{int(_CTX_WARN_RATIO*100)}% of context cap. "
                 f"Consider [cyan]/clear[/cyan] before adding more context."
             )
 
@@ -2617,11 +2700,13 @@ def main() -> None:
     pl.add_argument("--interval", type=float, default=5.0, help="Refresh seconds (min 1)")
     pl.add_argument("--budget-daily", type=float, dest="budget_daily",
                     help="Show projection vs daily budget in USD")
-    pl.add_argument("--context-warn", type=int, default=150_000, dest="context_warn",
+    pl.add_argument("--context-warn", type=int, default=None, dest="context_warn",
                     help="Warn when single-call context (input+cache_r+cache_w) "
-                         "reaches N tokens (default 150000 — 75%% of 200K cap)")
-    pl.add_argument("--context-alert", type=int, default=180_000, dest="context_alert",
-                    help="Red-alert threshold for single-call context (default 180000)")
+                         "reaches N tokens (default: 75%% of the model's cap — "
+                         "150K for 200K models, 750K for 1M models)")
+    pl.add_argument("--context-alert", type=int, default=None, dest="context_alert",
+                    help="Red-alert threshold for single-call context "
+                         "(default: 90%% of the model's cap)")
 
     ph = sub.add_parser("heatmap", parents=[common],
                         help="Day-of-week x hour-of-day usage heatmap (local time)")

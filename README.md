@@ -192,26 +192,46 @@ suggestions list.
 
 ### Large context (rule `large-context`)
 
-Sessions approaching the model's context cap (200K tokens for standard
-Sonnet/Opus, 1M for long-context variants) waste tokens — anything past
+Sessions approaching the model's context cap waste tokens — anything past
 the cap gets summarized away or dropped, but you still pay for it.
 
+Thresholds are **proportional to each model's cap**, not a fixed token
+count. A 750K call on Opus 4.7 (1M cap) is at 75% — the same risk profile
+as a 150K call on a 200K-cap model. Caps live in the `CONTEXT_CAP` dict
+in [monitor.py](monitor.py); Opus 4.6 and 4.7 default to 1M, everything
+else to 200K.
+
+| Model family | Cap | Warn (75%) | Alert (90%) |
+|---|---|---|---|
+| `claude-opus-4-6`, `claude-opus-4-7` | 1,000,000 | 750,000 | 900,000 |
+| Everything else (default) | 200,000 | 150,000 | 180,000 |
+
 ```
- ⚠ LARGE CONTEXT ALERT  10 session(s) ≥180.0K tok — context truncation likely.
+ ⚠ LARGE CONTEXT ALERT  10 session(s) ≥90% of context cap — truncation likely.
 ```
 
 Surfaces in three places:
 
 1. **`summary` / `report`** — red banner above the suggestions table when
-   any session has crossed the alert threshold (≥180K).
-2. **`suggest`** — `large-context` rule rows show peak per-call context,
-   count of calls over threshold, and an estimated savings figure.
+   any session has crossed the alert threshold (≥90% of its model's cap).
+2. **`suggest`** — `large-context` rule rows show peak per-call context
+   as both raw tokens and a percentage of the cap, plus the count of
+   calls over the warn/alert thresholds.
 3. **`live`** — active-session panel turns red when the current session's
    peak context crosses the alert threshold, with a
-   `⚠ NEAR/OVER 200K CAP — /clear NOW` inline warning.
+   `⚠ NEAR/OVER {cap} CAP — /clear NOW` inline warning where `{cap}` is
+   the active model's context cap.
 
-Defaults: warn at 150K tokens (75% of 200K), alert at 180K (90%).
-Tune via `live --context-warn N --context-alert N` for 1M-context models.
+CLI overrides for the `live` command: `--context-warn N` /
+`--context-alert N`. Default behavior derives both thresholds from the
+active session's model cap.
+
+> **Sonnet 1M-tier caveat:** `claude-sonnet-4-x` supports a 1M context
+> window on certain plans, but the model ID in the JSONL is identical for
+> 200K and 1M tiers — there's no way to tell from logs alone. Sonnet
+> stays at the 200K default. If you're on the 1M-Sonnet tier, override
+> with `--context-warn 750000 --context-alert 900000` for `live`, or edit
+> `CONTEXT_CAP` in [monitor.py](monitor.py) for `suggest`.
 
 ### Expensive single call (rule `expensive-single-call`)
 
@@ -271,8 +291,8 @@ recommendations. The same output is appended to `report --format html` as an
 | `cache-rebuild` | Session `cache_write / cache_read` > 0.2 | Long session with growing history — split with `/clear` |
 | `many-reads` | Session ≥ 30 Read calls, ≥ 40% of tool use, supported language | Use [ast-graph](https://github.com/emtyty/ast-graph) `symbol` / `blast-radius` instead of whole-file Reads |
 | `explore-on-opus` | Session ≥ 70% Opus, ≥ 85% exploration tools (Read/Grep/Glob/…) | Plan/analyze on Sonnet or Haiku; Opus only for synthesis. Pairs well with ast-graph |
-| `plan-mode-opus` | Session used `ExitPlanMode` **and** ≥ 70% Opus | Draft the plan on Sonnet; feed ast-graph `symbol`/`hotspots`/`blast-radius`/`dead-code` into the plan instead of Read/Grep-mapping by hand |
-| `large-context` | Session has any single call ≥ 150K tokens (input + cache_r + cache_w). High severity at ≥ 180K | `/clear` mid-session or split unrelated work. Tokens past the 200K cap are billed but get summarized/dropped |
+| `plan-mode-opus` | Plan window (records up to last `ExitPlanMode`) ≥ 5 calls, ≥ 70% Opus, ≥ 70% explore tools, ≥ 40% of session cost | Opus is right for plan synthesis — keep it. Feed ast-graph `symbol`/`hotspots`/`blast-radius`/`dead-code` into the plan input so Opus doesn't burn tokens Read/Grepping the codebase. Falls back to Sonnet/Haiku when the project isn't ast-graph-supported |
+| `large-context` | Any single call ≥ 75% of its model's context cap (warn) or ≥ 90% (alert/high). Caps: 1M for Opus 4.6/4.7, 200K otherwise — see `CONTEXT_CAP` in [monitor.py](monitor.py) | `/clear` mid-session or split unrelated work. Tokens past the cap are billed but get summarized/dropped |
 | `expensive-single-call` | Session contains any single API call > $5. High severity when any call ≥ $10 | Investigate the peak call — usually a huge file paste, runaway tool loop, or Opus turn that pulled in a massive context |
 | `cache-cold-session` | Session ≥ 5 calls AND cost > $2 AND cache hit rate < 30% | Keep related work in one session; avoid mid-task `/clear`. Distinct from `low-cache-hit` (per-project) — this catches single cold sessions inside an otherwise-warm project |
 
