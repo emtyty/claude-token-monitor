@@ -35,8 +35,11 @@ Parse `$ARGUMENTS` to decide which command to run:
 
 All commands use:
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/monitor.py" <command> [options]
+python "${CLAUDE_PLUGIN_ROOT}/../monitor.py" <command> [options]
 ```
+
+(Single source of truth lives at the repo root — `plugin/` previously
+shipped a duplicate that drifted; the duplicate has been removed.)
 
 ## After running, report
 

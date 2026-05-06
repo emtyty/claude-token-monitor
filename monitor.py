@@ -105,6 +105,86 @@ def parse_ts(ts: str | None) -> datetime | None:
         return None
 
 
+# ---------------------------- Time-window filter ---------------------------- #
+
+
+def _parse_duration(s: str) -> timedelta:
+    """Parse '7d', '24h', '30m', '2w' shorthand into a timedelta."""
+    s = (s or "").strip().lower()
+    if not s:
+        raise ValueError("empty duration")
+    unit = s[-1]
+    try:
+        n = float(s[:-1])
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid duration: {s!r} (expected '7d', '24h', '30m', '2w')"
+        ) from exc
+    if unit == "m":
+        return timedelta(minutes=n)
+    if unit == "h":
+        return timedelta(hours=n)
+    if unit == "d":
+        return timedelta(days=n)
+    if unit == "w":
+        return timedelta(weeks=n)
+    raise ValueError(f"unknown duration unit {unit!r} (use m/h/d/w)")
+
+
+def _parse_local_bound(s: str, *, end_of_day: bool = False) -> datetime:
+    """Parse YYYY-MM-DD (local-date) or full ISO timestamp into an aware datetime.
+
+    end_of_day=True bumps a date-only input to the start of the next day, so
+    that `--until 2026-04-30` includes everything up through April 30 23:59.
+    """
+    s = s.strip()
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        d = date.fromisoformat(s)
+        if end_of_day:
+            d = d + timedelta(days=1)
+        return datetime.combine(d, datetime.min.time()).astimezone()
+    return datetime.fromisoformat(s).astimezone()
+
+
+def parse_window(args) -> tuple[datetime | None, datetime | None]:
+    """Resolve --since / --until / --last on `args` into (since, until).
+
+    --last conflicts with --since. Returns (None, None) when no flags set.
+    Both bounds are timezone-aware (local zone).
+    """
+    since = until = None
+    last = getattr(args, "last", None)
+    s = getattr(args, "since", None)
+    u = getattr(args, "until", None)
+    if last:
+        if s:
+            raise SystemExit("error: --last conflicts with --since")
+        since = datetime.now().astimezone() - _parse_duration(last)
+    elif s:
+        since = _parse_local_bound(s)
+    if u:
+        until = _parse_local_bound(u, end_of_day=True)
+    return since, until
+
+
+def filter_records(records: list, args) -> list:
+    """Apply --since/--until/--last bounds from args, if present."""
+    since, until = parse_window(args)
+    if since is None and until is None:
+        return records
+    out = []
+    for r in records:
+        ts = parse_ts(r.timestamp)
+        if ts is None:
+            continue
+        if since and ts < since:
+            continue
+        if until and ts >= until:
+            continue
+        out.append(r)
+    return out
+
+
 @dataclass
 class Record:
     project: str
@@ -259,6 +339,11 @@ def fmt_cost(c: float) -> str:
 
 def load_all() -> list[Record]:
     return list(iter_records(projects_root()))
+
+
+def load_records(args) -> list[Record]:
+    """load_all() with --since/--until/--last from args applied."""
+    return filter_records(load_all(), args)
 
 
 # ----------------------- Tier-2 routing analytics ----------------------- #
@@ -431,7 +516,7 @@ def collect_routing_stats(root: Path, project_filter: str | None = None) -> list
 
 
 def cmd_summary(args) -> None:
-    records = load_all()
+    records = load_records(args)
     if not records:
         print("No usage records found in", projects_root())
         return
@@ -491,12 +576,13 @@ def cmd_summary(args) -> None:
     console.print(t)
 
     suggestions = analyze_suggestions(records)
+    _render_alert_banners(console, suggestions)
     if suggestions:
         _render_suggestions(console, suggestions, top=5)
 
 
 def cmd_daily(args) -> None:
-    records = load_all()
+    records = load_records(args)
     by_day = aggregate(
         records,
         lambda r: parse_ts(r.timestamp).date().isoformat() if parse_ts(r.timestamp) else None,
@@ -536,7 +622,7 @@ def cmd_daily(args) -> None:
 
 
 def cmd_projects(args) -> None:
-    records = load_all()
+    records = load_records(args)
     by_project = aggregate(records, lambda r: r.project)
     if not by_project:
         print("No records.")
@@ -568,7 +654,7 @@ def cmd_projects(args) -> None:
 
 
 def cmd_sessions(args) -> None:
-    records = load_all()
+    records = load_records(args)
     by_session = aggregate(records, lambda r: r.session_id)
     if not by_session:
         print("No records.")
@@ -596,7 +682,7 @@ def cmd_sessions(args) -> None:
 
 
 def cmd_export(args) -> None:
-    records = load_all()
+    records = load_records(args)
     if args.output == "-":
         out = sys.stdout
         close = False
@@ -645,10 +731,23 @@ def cmd_live(args) -> None:
     if not RICH:
         print("Live mode requires `pip install rich`.", file=sys.stderr)
         sys.exit(1)
+    from rich.console import Group
+    from rich.panel import Panel
     console = Console()
 
-    def render() -> Table:
+    warn_tok  = max(1, getattr(args, "context_warn",  _CTX_WARN_TOK))
+    alert_tok = max(warn_tok + 1, getattr(args, "context_alert", _CTX_ALERT_TOK))
+    budget_daily = getattr(args, "budget_daily", None)
+
+    def _ctx_tokens(r: Record) -> int:
+        u = r.usage
+        return (int(u.get("input_tokens") or 0)
+                + int(u.get("cache_read_input_tokens") or 0)
+                + int(u.get("cache_creation_input_tokens") or 0))
+
+    def render():
         records = load_all()
+        now = datetime.now().astimezone()
         today_iso = date.today().isoformat()
         yday_iso = (date.today() - timedelta(days=1)).isoformat()
         by_day = aggregate(
@@ -664,7 +763,7 @@ def cmd_live(args) -> None:
             total["cost"] += a["cost"]
 
         t = Table(
-            title=f"Claude Code Live Monitor  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            title=f"Claude Code Live Monitor  —  {now.strftime('%Y-%m-%d %H:%M:%S')}",
             box=box.ROUNDED, show_header=True, header_style="bold",
         )
         t.add_column("Scope"); t.add_column("Calls", justify="right")
@@ -682,7 +781,101 @@ def cmd_live(args) -> None:
                 fmt_num(a["cr"]), fmt_num(a["cw"]),
                 f"[{style}]{fmt_cost(a['cost'])}[/{style}]",
             )
-        return t
+
+        # ---------- burn rate over the last 30 minutes ----------
+        cutoff_30m = now - timedelta(minutes=30)
+        recent_30m = []
+        for r in records:
+            ts = parse_ts(r.timestamp)
+            if ts and ts >= cutoff_30m:
+                recent_30m.append(r)
+        cost_30m = sum(r.cost for r in recent_30m)
+        burn_per_hr = cost_30m * 2.0  # 30 min → hourly extrapolation
+        burn_line = (
+            f"[bold]Burn (30m):[/bold] [cyan]{fmt_cost(cost_30m)}[/cyan]  "
+            f"[bold]Rate:[/bold] [cyan]{fmt_cost(burn_per_hr)}/hr[/cyan]  "
+            f"[bold]Calls (30m):[/bold] {len(recent_30m)}"
+        )
+        # Optional daily-budget projection: at this rate, ETA to limit.
+        if budget_daily and budget_daily > 0:
+            remaining = max(0.0, budget_daily - today["cost"])
+            if burn_per_hr > 0 and remaining > 0:
+                eta_hours = remaining / burn_per_hr
+                eta_at = (now + timedelta(hours=eta_hours)).strftime("%H:%M")
+                pct_used = today["cost"] / budget_daily * 100
+                color = "red" if pct_used >= 100 else "yellow" if pct_used >= 80 else "green"
+                burn_line += (
+                    f"\n[bold]Daily budget:[/bold] "
+                    f"[{color}]{fmt_cost(today['cost'])} / {fmt_cost(budget_daily)} "
+                    f"({pct_used:.0f}%)[/{color}]  "
+                    f"[bold]ETA to limit at this rate:[/bold] [cyan]~{eta_at}[/cyan] "
+                    f"({eta_hours:.1f}h)"
+                )
+            elif today["cost"] >= budget_daily:
+                burn_line += (
+                    f"\n[bold red]Daily budget exceeded:[/bold red] "
+                    f"{fmt_cost(today['cost'])} / {fmt_cost(budget_daily)}"
+                )
+            else:
+                burn_line += (
+                    f"\n[bold]Daily budget:[/bold] "
+                    f"{fmt_cost(today['cost'])} / {fmt_cost(budget_daily)} "
+                    f"(idle — no spend in last 30m)"
+                )
+
+        # ---------- active session panel (records in last 10 min) ----------
+        cutoff_10m = now - timedelta(minutes=10)
+        active = [
+            r for r in records
+            if parse_ts(r.timestamp) and parse_ts(r.timestamp) >= cutoff_10m
+        ]
+        if active:
+            latest = max(active, key=lambda r: parse_ts(r.timestamp))
+            cur_session = latest.session_id
+            cur_recs = [r for r in records if r.session_id == cur_session]
+            ctx_values = [_ctx_tokens(r) for r in cur_recs]
+            peak_ctx = max(ctx_values) if ctx_values else 0
+            last_ctx = _ctx_tokens(latest)
+            cur_cost = sum(r.cost for r in cur_recs)
+            cur_calls = len(cur_recs)
+            cur_proj = shorten_path(decode_project(latest.project))
+            if len(cur_proj) > 60:
+                cur_proj = "…" + cur_proj[-57:]
+
+            if peak_ctx >= alert_tok:
+                ctx_color, border = "red", "red"
+                ctx_warn = (
+                    f"  [bold red on white] ⚠ NEAR/OVER 200K CAP — /clear NOW [/bold red on white]"
+                )
+            elif peak_ctx >= warn_tok:
+                ctx_color, border = "yellow", "yellow"
+                ctx_warn = "  [bold yellow]⚠ Large context — consider /clear[/bold yellow]"
+            else:
+                ctx_color, border = "green", "cyan"
+                ctx_warn = ""
+
+            ts_latest = parse_ts(latest.timestamp).astimezone().strftime("%H:%M:%S")
+            session_body = (
+                f"[bold]Session:[/bold] {cur_session[:8]}…   "
+                f"[bold]Project:[/bold] {cur_proj}\n"
+                f"[bold]Model:[/bold] {latest.model}   "
+                f"[bold]Calls:[/bold] {cur_calls}   "
+                f"[bold]Cost:[/bold] {fmt_cost(cur_cost)}   "
+                f"[bold]Last call:[/bold] {ts_latest}\n"
+                f"[bold]Context (last call):[/bold] [{ctx_color}]{fmt_num(last_ctx)} tok[/{ctx_color}]   "
+                f"[bold]Peak this session:[/bold] [{ctx_color}]{fmt_num(peak_ctx)} tok[/{ctx_color}]"
+                f"{ctx_warn}"
+            )
+            session_panel = Panel(
+                session_body, title="Active Session (last 10 min)",
+                border_style=border,
+            )
+            return Group(t, burn_line, session_panel)
+
+        return Group(
+            t, burn_line,
+            "[dim]No activity in the last 10 minutes — waiting for a Claude Code session…[/dim]",
+        )
 
     with Live(render(), refresh_per_second=2, console=console, screen=False) as live:
         try:
@@ -723,7 +916,7 @@ def cmd_heatmap(args) -> None:
     if not RICH:
         print("Heatmap requires `pip install rich`.", file=sys.stderr)
         sys.exit(1)
-    records = load_all()
+    records = load_records(args)
     metric = args.metric  # "cost" | "calls" | "tokens"
 
     # grid[dow 0=Mon..6=Sun][hour 0..23] = float
@@ -799,7 +992,7 @@ def cmd_heatmap(args) -> None:
 
 def cmd_trend(args) -> None:
     """Daily cost/token trend for a single project (substring match)."""
-    records = load_all()
+    records = load_records(args)
     q = args.project.lower()
     matches: list[Record] = [
         r for r in records
@@ -875,7 +1068,7 @@ def _iso_week_start(d: date) -> date:
 
 def cmd_weekly(args) -> None:
     """Per-ISO-week usage (Mon-Sun)."""
-    records = load_all()
+    records = load_records(args)
 
     by_week: dict[str, dict] = defaultdict(empty_agg)
     week_sessions: dict[str, set] = defaultdict(set)
@@ -946,7 +1139,7 @@ def cmd_calendar(args) -> None:
     if not RICH:
         print("Calendar requires `pip install rich`.", file=sys.stderr)
         sys.exit(1)
-    records = load_all()
+    records = load_records(args)
     year = args.year or date.today().year
 
     day_cost: dict[date, float] = defaultdict(float)
@@ -1016,7 +1209,7 @@ def cmd_calendar(args) -> None:
 
 def cmd_cache(args) -> None:
     """Cache efficiency analysis: hit rate and estimated savings."""
-    records = load_all()
+    records = load_records(args)
     if not records:
         print("No records.")
         return
@@ -1112,7 +1305,7 @@ def cmd_report(args) -> None:
     width = args.width
     console = Console(record=True, width=width, force_terminal=True, color_system="truecolor")
 
-    records = load_all()
+    records = load_records(args)
 
     # Optional project filter
     project_label: str | None = None
@@ -1331,10 +1524,11 @@ def cmd_report(args) -> None:
                 "by prompt fingerprint; unmatched rows show '—'.[/dim]"
             )
 
-        # Section 7: suggestions
+        # Section 7: suggestions (with large-context alert pinned above)
         console.print()
         console.rule("[bold]Efficiency Suggestions[/bold]")
         suggestions = analyze_suggestions(records)
+        _render_alert_banners(console, suggestions)
         _render_suggestions(console, suggestions, top=15)
 
         console.print()
@@ -1375,7 +1569,7 @@ def cmd_report(args) -> None:
 
 def cmd_activity(args) -> None:
     """Per-day engagement: unique sessions active, unique projects touched."""
-    records = load_all()
+    records = load_records(args)
 
     @dataclass
     class DayStats:
@@ -1977,6 +2171,196 @@ def _rule_plan_mode_opus(records: list[Record]) -> list[Suggestion]:
     return out
 
 
+_CTX_WARN_TOK  = 150_000   # 75% of standard 200K context cap
+_CTX_ALERT_TOK = 180_000   # 90% — at this point context truncation is imminent
+
+
+def _rule_large_context(records: list[Record]) -> list[Suggestion]:
+    """Rule 11: session whose single-call context (input + cache_r + cache_w)
+    approaches or breaches the model's context cap.
+
+    Standard Sonnet/Opus cap is 200K tokens; some 1M-context variants exist.
+    Calls ≥150K are at risk of summarization/truncation; ≥180K means you're
+    paying for tokens that may never reach the model. We surface the worst
+    offending sessions per (project, session) and recommend `/clear` or a
+    smaller working set.
+    """
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        contexts = [
+            int(r.usage.get("input_tokens") or 0)
+            + int(r.usage.get("cache_read_input_tokens") or 0)
+            + int(r.usage.get("cache_creation_input_tokens") or 0)
+            for r in recs
+        ]
+        if not contexts:
+            continue
+        peak = max(contexts)
+        if peak < _CTX_WARN_TOK:
+            continue
+        n_warn  = sum(1 for c in contexts if c >= _CTX_WARN_TOK)
+        n_alert = sum(1 for c in contexts if c >= _CTX_ALERT_TOK)
+        cost = sum(r.cost for r in recs)
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        # Savings estimate: assume `/clear` mid-session would have shed ~30%
+        # of input-side cost on the bloated tail. Conservative.
+        input_side_cost = sum(
+            (int(r.usage.get("input_tokens") or 0)
+             + int(r.usage.get("cache_read_input_tokens") or 0)
+             + int(r.usage.get("cache_creation_input_tokens") or 0))
+            * model_price(r.model)["cr"] / 1_000_000
+            for r in recs if (
+                int(r.usage.get("input_tokens") or 0)
+                + int(r.usage.get("cache_read_input_tokens") or 0)
+                + int(r.usage.get("cache_creation_input_tokens") or 0)
+            ) >= _CTX_WARN_TOK
+        )
+        savings = input_side_cost * 0.3
+        severity = "high" if n_alert else "med"
+        out.append(Suggestion(
+            rule="large-context",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"peak {fmt_num(peak)} tok · "
+                f"{n_warn} call(s) ≥{fmt_num(_CTX_WARN_TOK)}"
+                + (f", {n_alert} ≥{fmt_num(_CTX_ALERT_TOK)}" if n_alert else "")
+                + f" · {len(recs)} calls · {fmt_cost(cost)}"
+            ),
+            action=(
+                "Session is approaching the 200K context cap — use `/clear` to "
+                "reset, or split unrelated work across sessions. Tokens past the "
+                "cap get summarized away (or dropped) but you still pay for them."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
+_EXPENSIVE_CALL_WARN_USD  = 5.0    # one call costs > $5 → suspicious
+_EXPENSIVE_CALL_ALERT_USD = 10.0   # one call costs > $10 → almost certainly pathological
+
+
+def _rule_expensive_single_call(records: list[Record]) -> list[Suggestion]:
+    """Rule 12: any individual API call costing more than $5 — runaway turns,
+    huge file pastes, log dumps, or a single Opus turn that hauled in a
+    massive context.
+
+    Aggregates per session so a session with N expensive calls produces ONE
+    finding (not N). Severity bumps to 'high' when any call ≥ $10 — at that
+    point you're virtually certain something went wrong, not just expensive
+    work.
+    """
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        expensive = [r for r in recs if r.cost > _EXPENSIVE_CALL_WARN_USD]
+        if not expensive:
+            continue
+        peak = max(expensive, key=lambda r: r.cost)
+        n_alert = sum(1 for r in expensive if r.cost >= _EXPENSIVE_CALL_ALERT_USD)
+        cost = sum(r.cost for r in recs)
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        peak_ctx = (
+            int(peak.usage.get("input_tokens") or 0)
+            + int(peak.usage.get("cache_read_input_tokens") or 0)
+            + int(peak.usage.get("cache_creation_input_tokens") or 0)
+        )
+        severity = "high" if n_alert else "med"
+        out.append(Suggestion(
+            rule="expensive-single-call",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{len(expensive)} call(s) >{fmt_cost(_EXPENSIVE_CALL_WARN_USD)}"
+                + (f" ({n_alert} ≥{fmt_cost(_EXPENSIVE_CALL_ALERT_USD)})" if n_alert else "")
+                + f" · peak {fmt_cost(peak.cost)} on {peak.model} "
+                f"({fmt_num(peak_ctx)} tok ctx) · session total {fmt_cost(cost)}"
+            ),
+            action=(
+                "Investigate the peak call — typical causes: an enormous file "
+                "paste, a runaway tool loop, or an Opus turn that pulled in a "
+                "huge context. Open the session's JSONL or use `monitor "
+                "sessions --top` to drill in."
+            ),
+            est_savings=0.0,
+        ))
+    return out
+
+
+_COLD_CACHE_HIT_PCT      = 0.30   # below 30% cache reuse = "cold"
+_COLD_CACHE_MIN_CALLS    = 5
+_COLD_CACHE_MIN_COST_USD = 2.0
+
+
+def _rule_cache_cold_session(records: list[Record]) -> list[Suggestion]:
+    """Rule 13: per-session cache-cold detection.
+
+    Distinct from rule 3 (`low-cache-hit`) which fires per-project — this
+    catches single sessions that ran cold even inside an otherwise
+    cache-efficient project. Typical causes: started fresh and stayed
+    short, repeated `/clear` mid-task, or jumping between unrelated files
+    so the prefix never stabilizes.
+    """
+    by_session: dict[str, list[Record]] = defaultdict(list)
+    for r in records:
+        if r.session_id:
+            by_session[r.session_id].append(r)
+    out: list[Suggestion] = []
+    for sess, recs in by_session.items():
+        if len(recs) < _COLD_CACHE_MIN_CALLS:
+            continue
+        cost = sum(r.cost for r in recs)
+        if cost < _COLD_CACHE_MIN_COST_USD:
+            continue
+        inp = sum(int(r.usage.get("input_tokens") or 0) for r in recs)
+        cr  = sum(int(r.usage.get("cache_read_input_tokens") or 0) for r in recs)
+        cw  = sum(int(r.usage.get("cache_creation_input_tokens") or 0) for r in recs)
+        denom = inp + cr + cw
+        if denom == 0:
+            continue
+        hit = cr / denom
+        if hit >= _COLD_CACHE_HIT_PCT:
+            continue
+        # Savings estimate: if the hit rate had climbed to ~70%, half of the
+        # current raw input tokens would have been cache-reads (≈10× cheaper).
+        # Conservative — treats only raw input as shiftable.
+        savings = 0.0
+        for r in recs:
+            p = model_price(r.model)
+            raw_in = int(r.usage.get("input_tokens") or 0)
+            shiftable = raw_in * 0.5
+            savings += shiftable * (p["in"] - p["cr"]) / 1_000_000
+        projects = {decode_project(r.project) for r in recs}
+        proj = shorten_path(next(iter(projects))) if len(projects) == 1 else "multiple"
+        severity = "med" if savings >= 3 else "low"
+        out.append(Suggestion(
+            rule="cache-cold-session",
+            severity=severity,
+            scope=f"session {sess[:8]} ({proj})",
+            evidence=(
+                f"{len(recs)} calls · cache hit {hit*100:.0f}% (cold) · "
+                f"{fmt_cost(cost)}"
+            ),
+            action=(
+                "Session ran without cache reuse — likely started fresh and "
+                "did not stay long enough to amortize the prefix. Keep "
+                "related work in one session; avoid mid-task `/clear`."
+            ),
+            est_savings=savings,
+        ))
+    return out
+
+
 def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
     rules = [
         _rule_opus_heavy_project,
@@ -1989,6 +2373,9 @@ def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
         _rule_many_reads,
         _rule_explore_on_opus,
         _rule_plan_mode_opus,
+        _rule_large_context,
+        _rule_expensive_single_call,
+        _rule_cache_cold_session,
     ]
     out: list[Suggestion] = []
     for rule in rules:
@@ -1996,6 +2383,45 @@ def analyze_suggestions(records: list[Record]) -> list[Suggestion]:
     sev_order = {"high": 0, "med": 1, "low": 2}
     out.sort(key=lambda s: (sev_order.get(s.severity, 9), -s.est_savings))
     return out
+
+
+def _render_alert_banners(console, suggestions: list[Suggestion]) -> None:
+    """Print high-visibility alert banners above the suggestions table.
+
+    Banners are reserved for rules whose findings are urgent / expensive
+    enough to deserve a 'stop, look at me' visual treatment instead of a
+    plain row. Add new banners here as new alert rules are introduced.
+    """
+    # --- large-context (rule 11) ---
+    big = [s for s in suggestions if s.rule == "large-context"]
+    if big:
+        high = [s for s in big if s.severity == "high"]
+        if high:
+            console.print(
+                f"\n[bold red on white] ⚠ LARGE CONTEXT ALERT [/bold red on white] "
+                f"[bold red]{len(high)} session(s) ≥{fmt_num(_CTX_ALERT_TOK)} tok "
+                f"— context truncation likely.[/bold red] "
+                f"Run [cyan]monitor suggest[/cyan] for details."
+            )
+        else:
+            console.print(
+                f"\n[bold yellow]⚠ Large-context warning:[/bold yellow] "
+                f"{len(big)} session(s) ≥{fmt_num(_CTX_WARN_TOK)} tok. "
+                f"Consider [cyan]/clear[/cyan] before adding more context."
+            )
+
+    # --- expensive-single-call (rule 12) — only banner the high-severity tier ---
+    expensive_high = [
+        s for s in suggestions
+        if s.rule == "expensive-single-call" and s.severity == "high"
+    ]
+    if expensive_high:
+        console.print(
+            f"\n[bold red on white] 💸 EXPENSIVE CALL ALERT [/bold red on white] "
+            f"[bold red]{len(expensive_high)} session(s) with single calls "
+            f"≥{fmt_cost(_EXPENSIVE_CALL_ALERT_USD)}[/bold red] "
+            f"— see suggestions table for the peak call to investigate."
+        )
 
 
 def _render_suggestions(console, suggestions: list[Suggestion], top: int) -> None:
@@ -2031,7 +2457,7 @@ def _render_suggestions(console, suggestions: list[Suggestion], top: int) -> Non
 
 
 def cmd_suggest(args) -> None:
-    records = load_all()
+    records = load_records(args)
     if not records:
         print("No records.")
         return
@@ -2054,33 +2480,54 @@ def cmd_suggest(args) -> None:
 
 
 def cmd_budget(args) -> None:
-    """Check today's and this month's spend against daily/monthly limits."""
+    """Check spend against daily / monthly / quarterly / yearly / rolling-30 / lifetime limits.
+
+    Today and Month are always shown. Quarter / Year / Rolling-30 / Lifetime
+    are only shown when their --flag is given (so the table stays tight by
+    default). Any limit can be in 'tracking' mode (no --flag) to just show
+    spend without a cap.
+    """
     records = load_all()
     today = date.today()
     month_start = today.replace(day=1)
+    quarter_num = (today.month - 1) // 3 + 1
+    quarter_start = date(today.year, (quarter_num - 1) * 3 + 1, 1)
+    year_start = date(today.year, 1, 1)
+    rolling_30_start = today - timedelta(days=29)  # last 30 days incl today
 
-    today_cost = 0.0
-    month_cost = 0.0
+    today_cost = month_cost = quarter_cost = year_cost = rolling_cost = lifetime_cost = 0.0
     for r in records:
         ts = parse_ts(r.timestamp)
         if ts is None:
             continue
         d = ts.astimezone().date()
+        lifetime_cost += r.cost
         if d == today:
             today_cost += r.cost
         if d >= month_start:
             month_cost += r.cost
+        if d >= quarter_start:
+            quarter_cost += r.cost
+        if d >= year_start:
+            year_cost += r.cost
+        if d >= rolling_30_start:
+            rolling_cost += r.cost
 
-    # build rows: (label, spent, limit)
-    rows: list[tuple[str, float, float | None]] = []
-    if args.daily is not None:
-        rows.append(("Today", today_cost, args.daily))
-    else:
-        rows.append(("Today", today_cost, None))
-    if args.monthly is not None:
-        rows.append((f"Month ({month_start:%b %Y})", month_cost, args.monthly))
-    else:
-        rows.append((f"Month ({month_start:%b %Y})", month_cost, None))
+    # Always show today + this month. Higher-period rows only render when
+    # the user passed a corresponding limit flag.
+    rows: list[tuple[str, float, float | None]] = [
+        ("Today", today_cost, args.daily),
+        (f"Month ({month_start:%b %Y})", month_cost, args.monthly),
+    ]
+    if args.quarterly is not None:
+        rows.append((f"Quarter ({quarter_start.year}-Q{quarter_num})",
+                     quarter_cost, args.quarterly))
+    if args.yearly is not None:
+        rows.append((f"Year {year_start.year}", year_cost, args.yearly))
+    if args.rolling_30 is not None:
+        rows.append(("Rolling 30d", rolling_cost, args.rolling_30))
+    if args.lifetime is not None:
+        rows.append(("Lifetime", lifetime_cost, args.lifetime))
 
     worst_frac = 0.0
     if not RICH:
@@ -2139,58 +2586,89 @@ def main() -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("summary", help="Overall totals and per-model breakdown")
+    # Common time-window flags shared by every aggregation command.
+    # Not added to `live` (real-time by definition) or `budget` (computes its
+    # own per-period windows).
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--since", metavar="DATE",
+                        help="Filter records since YYYY-MM-DD (local) or full ISO timestamp.")
+    common.add_argument("--until", metavar="DATE",
+                        help="Filter records up through YYYY-MM-DD (inclusive) or full ISO timestamp.")
+    common.add_argument("--last", metavar="DUR",
+                        help="Shortcut for --since: e.g. 7d, 24h, 30m, 2w. Conflicts with --since.")
 
-    pd = sub.add_parser("daily", help="Daily usage breakdown")
+    sub.add_parser("summary", parents=[common],
+                   help="Overall totals and per-model breakdown")
+
+    pd = sub.add_parser("daily", parents=[common], help="Daily usage breakdown")
     pd.add_argument("--days", type=int, default=14, help="How many days to show (default 14)")
 
-    pp = sub.add_parser("projects", help="Top projects by cost")
+    pp = sub.add_parser("projects", parents=[common], help="Top projects by cost")
     pp.add_argument("--top", type=int, default=20)
 
-    ps = sub.add_parser("sessions", help="Top sessions by cost")
+    ps = sub.add_parser("sessions", parents=[common], help="Top sessions by cost")
     ps.add_argument("--top", type=int, default=20)
 
-    pe = sub.add_parser("export", help="Export raw records")
+    pe = sub.add_parser("export", parents=[common], help="Export raw records")
     pe.add_argument("--format", choices=["csv", "json"], default="csv")
     pe.add_argument("--output", "-o", default="-", help="Output path or '-' for stdout")
 
     pl = sub.add_parser("live", help="Live auto-refreshing dashboard")
     pl.add_argument("--interval", type=float, default=5.0, help="Refresh seconds (min 1)")
+    pl.add_argument("--budget-daily", type=float, dest="budget_daily",
+                    help="Show projection vs daily budget in USD")
+    pl.add_argument("--context-warn", type=int, default=150_000, dest="context_warn",
+                    help="Warn when single-call context (input+cache_r+cache_w) "
+                         "reaches N tokens (default 150000 — 75%% of 200K cap)")
+    pl.add_argument("--context-alert", type=int, default=180_000, dest="context_alert",
+                    help="Red-alert threshold for single-call context (default 180000)")
 
-    ph = sub.add_parser("heatmap", help="Day-of-week x hour-of-day usage heatmap (local time)")
+    ph = sub.add_parser("heatmap", parents=[common],
+                        help="Day-of-week x hour-of-day usage heatmap (local time)")
     ph.add_argument("--metric", choices=["cost", "calls", "tokens"], default="cost")
 
-    pt = sub.add_parser("trend", help="Daily trend for one project (substring match)")
+    pt = sub.add_parser("trend", parents=[common],
+                        help="Daily trend for one project (substring match)")
     pt.add_argument("project", help="Path substring, e.g. 'ZeroCTX' or 'Desktop/Code/idea'")
     pt.add_argument("--days", type=int, default=30, help="Limit to last N active days (0 = all)")
 
-    pa = sub.add_parser("activity", help="Per-day unique sessions & projects active (engagement)")
+    pa = sub.add_parser("activity", parents=[common],
+                        help="Per-day unique sessions & projects active (engagement)")
     pa.add_argument("--days", type=int, default=30, help="Limit to last N active days (0 = all)")
 
-    pw = sub.add_parser("weekly", help="Per-ISO-week usage (Mon-Sun buckets)")
+    pw = sub.add_parser("weekly", parents=[common], help="Per-ISO-week usage (Mon-Sun buckets)")
     pw.add_argument("--weeks", type=int, default=12, help="Last N weeks (default 12)")
 
-    pc = sub.add_parser("calendar", help="GitHub-style yearly activity grid")
+    pc = sub.add_parser("calendar", parents=[common], help="GitHub-style yearly activity grid")
     pc.add_argument("--year", type=int, help="Year to show (default: current year)")
     pc.add_argument("--metric", choices=["cost", "calls"], default="cost")
 
-    pca = sub.add_parser("cache", help="Cache hit rate and estimated savings per project")
+    pca = sub.add_parser("cache", parents=[common],
+                         help="Cache hit rate and estimated savings per project")
     pca.add_argument("--top", type=int, default=15)
 
-    pr = sub.add_parser("report", help="Export a full dashboard (HTML/SVG/TXT)")
+    pr = sub.add_parser("report", parents=[common],
+                        help="Export a full dashboard (HTML/SVG/TXT)")
     pr.add_argument("--format", choices=["html", "svg", "txt"], default="txt")
     pr.add_argument("--output", "-o", help="Output path (default: claude-usage-<date>.<ext>)")
     pr.add_argument("--width", type=int, default=140, help="Render width in columns")
     pr.add_argument("--project", help="Filter to one project (substring match, e.g. 'my-app')")
 
-    psg = sub.add_parser("suggest", help="Detect inefficient usage patterns and suggest savings")
+    psg = sub.add_parser("suggest", parents=[common],
+                         help="Detect inefficient usage patterns and suggest savings")
     psg.add_argument("--top", type=int, default=20, help="Max suggestions to show (default 20)")
     psg.add_argument("--min-savings", type=float, default=0.0,
                      help="Hide quantified suggestions with est. savings below $X")
 
-    pb = sub.add_parser("budget", help="Check spend vs daily/monthly limits")
+    pb = sub.add_parser("budget",
+                        help="Check spend vs daily/monthly/quarterly/yearly/rolling/lifetime limits")
     pb.add_argument("--daily", type=float, help="Daily budget in USD, e.g. 10")
     pb.add_argument("--monthly", type=float, help="Monthly budget in USD, e.g. 200")
+    pb.add_argument("--quarterly", type=float, help="Quarterly budget in USD, e.g. 600")
+    pb.add_argument("--yearly", type=float, help="Yearly budget in USD, e.g. 2400")
+    pb.add_argument("--rolling-30", type=float, dest="rolling_30",
+                    help="Rolling 30-day budget in USD")
+    pb.add_argument("--lifetime", type=float, help="Lifetime cap in USD")
     pb.add_argument("--warn-at", type=float, default=0.8,
                     help="Warn when spend reaches this fraction of limit (default 0.8)")
     pb.add_argument("--strict", action="store_true",

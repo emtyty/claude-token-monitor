@@ -81,11 +81,14 @@ frontmatter misconfigured).
 python monitor.py <command> [options]
 ```
 
+Most commands accept the **global time-window flags** (`--since / --until / --last`)
+to scope their output. See [Time-window filter](#time-window-filter) below.
+
 ### Commands
 
 | Command | Purpose |
 |---|---|
-| `summary` | Grand totals and per-model breakdown |
+| `summary` | Grand totals and per-model breakdown (large-context alert pinned at top) |
 | `daily [--days N]` | Daily breakdown (default 14 days) |
 | `projects [--top N]` | Top projects by cost (default 20) |
 | `sessions [--top N]` | Top sessions by cost |
@@ -96,10 +99,26 @@ python monitor.py <command> [options]
 | `activity [--days N]` | Per-day unique sessions & projects active + top project of each day |
 | `cache [--top N]` | Cache hit rate + estimated savings per project |
 | `suggest [--top N] [--min-savings USD]` | Detect inefficient usage patterns and suggest savings |
-| `budget [--daily USD] [--monthly USD] [--warn-at 0.8] [--strict]` | Today + MTD spend vs limits |
-| `live [--interval S]` | Auto-refreshing dashboard |
+| `budget [--daily \| --monthly \| --quarterly \| --yearly \| --rolling-30 \| --lifetime USD] [--warn-at 0.8] [--strict]` | Spend vs any combination of period limits |
+| `live [--interval S] [--budget-daily USD] [--context-warn N] [--context-alert N]` | Auto-refreshing dashboard with burn rate + active-session panel |
 | `export --format csv\|json [-o path]` | Raw per-call records |
-| `report --format html\|svg\|txt [-o path]` | Full dashboard export (for archive / print-to-PDF) |
+| `report --format html\|svg\|txt [-o path] [--project SUBSTR] [--width N]` | Full dashboard export (filterable to one project) |
+
+### Time-window filter
+
+Every aggregation command (`summary`, `daily`, `weekly`, `projects`, `sessions`,
+`heatmap`, `calendar`, `trend`, `activity`, `cache`, `suggest`, `report`,
+`export`) accepts:
+
+| Flag | Meaning |
+|---|---|
+| `--since YYYY-MM-DD` | Records on or after this local date |
+| `--until YYYY-MM-DD` | Records up through this local date (inclusive) |
+| `--last <duration>` | Shortcut for `--since now-<duration>`. Conflicts with `--since`. Units: `m` / `h` / `d` / `w`. Examples: `7d`, `24h`, `30m`, `2w` |
+
+`--since` and `--until` also accept full ISO timestamps if you need
+sub-day precision. `live` and `budget` deliberately ignore these — `live`
+is realtime, `budget` computes its own per-period windows.
 
 ### Examples
 
@@ -107,11 +126,14 @@ python monitor.py <command> [options]
 # What have I spent?
 python monitor.py summary
 
-# Last week, day by day
-python monitor.py daily --days 7
+# Spend during the current sprint (April 1 → 30)
+python monitor.py summary --since 2026-04-01 --until 2026-04-30
 
-# Which projects cost the most?
-python monitor.py projects --top 10
+# Just the last 7 days, broken down by day
+python monitor.py daily --last 7d
+
+# Last 24 hours of activity, grouped by project
+python monitor.py projects --last 24h
 
 # Trend for one project (substring of path)
 python monitor.py trend ZeroCTX
@@ -123,14 +145,16 @@ python monitor.py heatmap --metric calls
 # How many sessions / projects did I juggle per day?
 python monitor.py activity --days 30
 
-# Am I over budget?
+# Am I over budget? (any combination of periods)
 python monitor.py budget --daily 30 --monthly 500
+python monitor.py budget --quarterly 1500 --yearly 5000
+python monitor.py budget --rolling-30 600 --lifetime 10000
 
-# CI / cron guard — exit 1 if over, 2 if above warn threshold
+# CI / cron guard — exit 1 if over any limit, 2 if above warn threshold
 python monitor.py budget --monthly 500 --strict
 
-# Live dashboard while coding
-python monitor.py live --interval 3
+# Live dashboard while coding (with burn rate + budget projection)
+python monitor.py live --interval 3 --budget-daily 30
 
 # Week-level view
 python monitor.py weekly --weeks 8
@@ -148,12 +172,75 @@ python monitor.py suggest --top 10 --min-savings 5
 # Export full dashboard to HTML (then browser Print -> Save as PDF)
 python monitor.py report --format html -o usage-report.html
 
+# Single-project dashboard — useful for shareable per-project reports
+python monitor.py report --format html --project ZeroCTX -o zeroctx.html
+
 # Or archive as SVG (color-accurate, scales cleanly)
 python monitor.py report --format svg -o usage-report.svg
 
-# Export raw per-call records to CSV
+# Export raw per-call records to CSV (filterable by date range)
 python monitor.py export --format csv -o usage.csv
+python monitor.py export --format csv --since 2026-04-01 --until 2026-04-30 -o april.csv
 ```
+
+## Alerts
+
+`summary` and `report` print high-visibility banners above the suggestions
+table when one of the alert rules fires. The goal is to catch your eye on
+problems that are too important to leave as an ordinary row in a 50-row
+suggestions list.
+
+### Large context (rule `large-context`)
+
+Sessions approaching the model's context cap (200K tokens for standard
+Sonnet/Opus, 1M for long-context variants) waste tokens — anything past
+the cap gets summarized away or dropped, but you still pay for it.
+
+```
+ ⚠ LARGE CONTEXT ALERT  10 session(s) ≥180.0K tok — context truncation likely.
+```
+
+Surfaces in three places:
+
+1. **`summary` / `report`** — red banner above the suggestions table when
+   any session has crossed the alert threshold (≥180K).
+2. **`suggest`** — `large-context` rule rows show peak per-call context,
+   count of calls over threshold, and an estimated savings figure.
+3. **`live`** — active-session panel turns red when the current session's
+   peak context crosses the alert threshold, with a
+   `⚠ NEAR/OVER 200K CAP — /clear NOW` inline warning.
+
+Defaults: warn at 150K tokens (75% of 200K), alert at 180K (90%).
+Tune via `live --context-warn N --context-alert N` for 1M-context models.
+
+### Expensive single call (rule `expensive-single-call`)
+
+Any one API call costing more than $5 is suspicious; ≥$10 is almost
+always pathological — a huge file paste, a runaway tool loop, or an Opus
+turn that hauled in a massive context.
+
+```
+ 💸 EXPENSIVE CALL ALERT  3 session(s) with single calls ≥$10.00
+```
+
+Surfaces in two places:
+
+1. **`summary` / `report`** — red banner when any session has at least one
+   call ≥ $10. Aggregates per session so the banner counts sessions, not
+   raw call count (one bad session ≠ ten alerts).
+2. **`suggest`** — `expensive-single-call` rule rows show the peak call's
+   cost, model, context size, and the session total.
+
+Thresholds are module-level constants (`_EXPENSIVE_CALL_WARN_USD = 5`,
+`_EXPENSIVE_CALL_ALERT_USD = 10` in [monitor.py](monitor.py)). Edit them
+if your typical work runs hotter than these defaults.
+
+### Cache-cold session (rule `cache-cold-session`)
+
+Per-session cache-cold detection: ≥5 calls, cost > $2, cache hit rate <30%.
+Distinct from the project-level `low-cache-hit` rule — catches single
+sessions that ran cold even inside an otherwise cache-efficient project.
+No banner (not urgent enough); shows in the suggestions table only.
 
 ## PDF output
 
@@ -169,7 +256,7 @@ This is typically sharper than library-rendered PDF, and needs no extra install.
 
 ## Suggestions engine
 
-`suggest` runs 9 rules over your logs and flags concrete, dollar-quantified
+`suggest` runs 13 rules over your logs and flags concrete, dollar-quantified
 recommendations. The same output is appended to `report --format html` as an
 "Efficiency Suggestions" section.
 
@@ -185,6 +272,9 @@ recommendations. The same output is appended to `report --format html` as an
 | `many-reads` | Session ≥ 30 Read calls, ≥ 40% of tool use, supported language | Use [ast-graph](https://github.com/emtyty/ast-graph) `symbol` / `blast-radius` instead of whole-file Reads |
 | `explore-on-opus` | Session ≥ 70% Opus, ≥ 85% exploration tools (Read/Grep/Glob/…) | Plan/analyze on Sonnet or Haiku; Opus only for synthesis. Pairs well with ast-graph |
 | `plan-mode-opus` | Session used `ExitPlanMode` **and** ≥ 70% Opus | Draft the plan on Sonnet; feed ast-graph `symbol`/`hotspots`/`blast-radius`/`dead-code` into the plan instead of Read/Grep-mapping by hand |
+| `large-context` | Session has any single call ≥ 150K tokens (input + cache_r + cache_w). High severity at ≥ 180K | `/clear` mid-session or split unrelated work. Tokens past the 200K cap are billed but get summarized/dropped |
+| `expensive-single-call` | Session contains any single API call > $5. High severity when any call ≥ $10 | Investigate the peak call — usually a huge file paste, runaway tool loop, or Opus turn that pulled in a massive context |
+| `cache-cold-session` | Session ≥ 5 calls AND cost > $2 AND cache hit rate < 30% | Keep related work in one session; avoid mid-task `/clear`. Distinct from `low-cache-hit` (per-project) — this catches single cold sessions inside an otherwise-warm project |
 
 Rules 8, 9 and 10 check the project's `Read` file extensions against
 ast-graph's supported languages (Rust, Python, JS/TS, C#, Java) — the
@@ -242,11 +332,25 @@ lines that carry the same (full) usage block — and aggregates from there.
 
 ## Budget alerts in practice
 
+`budget` supports six independent period limits — pass any combination:
+
+| Flag | Period |
+|---|---|
+| `--daily USD` | Today (local) |
+| `--monthly USD` | Current calendar month |
+| `--quarterly USD` | Current calendar quarter (Jan-Mar / Apr-Jun / Jul-Sep / Oct-Dec) |
+| `--yearly USD` | Current calendar year |
+| `--rolling-30 USD` | Trailing 30 days incl. today |
+| `--lifetime USD` | All-time spend cap |
+
+Today and Month rows are always shown (without limits if no flag is given);
+the others render only when their flag is set so the table stays compact.
+
 `budget --strict` is the scripting-friendly mode. Exit codes:
 
-- `0` — under warn threshold
-- `2` — over warn threshold (default 80% of limit)
-- `1` — over limit
+- `0` — under warn threshold across **all** configured limits
+- `2` — over warn threshold (default 80%) on any limit
+- `1` — over limit on any configured period
 
 Drop it into a cron / scheduled task:
 
